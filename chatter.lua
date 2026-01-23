@@ -10,6 +10,14 @@ local settings = require('settings')
 local ffi = require('ffi')
 local bit = require('bit')
 
+local SAVE_DEBOUNCE_SEC = 0.5
+local save_pending = false
+local last_save_request = 0
+local function request_save()
+    save_pending = true
+    last_save_request = os.clock()
+end
+
 -- Windows Clipboard APIs
 ffi.cdef[[
     void* GlobalAlloc(unsigned uFlags, size_t dwBytes);
@@ -76,7 +84,6 @@ local config = settings.load(T{
     background_color = {1.0, 1.0, 1.0, 1.0},
     border_color = {1.0, 1.0, 1.0, 1.0},
     outline_color = {0.0, 0.0, 0.0, 1.0},
-    layout_history_lines = 50,
     colors = T{
         chat = T{
             say = {1.0, 1.0, 1.0, 1.0},
@@ -119,10 +126,6 @@ if config.outline_color == nil then
     config.outline_color = {0.0, 0.0, 0.0, 1.0}
 end
 
-if config.layout_history_lines == nil then
-    config.layout_history_lines = 50
-end
-
 if config.colors and config.colors.self and config.colors.others and config.colors.self == config.colors.others then
     local copy = T{}
     for k, v in pairs(config.colors.self) do
@@ -133,7 +136,7 @@ if config.colors and config.colors.self and config.colors.others and config.colo
         end
     end
     config.colors.others = copy
-    settings.save()
+    request_save()
 end
 
 local CHAT_MODES = {
@@ -228,7 +231,7 @@ local function edit_color(label, tbl, key)
     local value = {col[1], col[2], col[3], col[4]}
     if imgui.ColorEdit4(label, value) then
         tbl[key] = value
-        settings.save()
+        request_save()
     end
 end
 
@@ -263,7 +266,6 @@ local copy_menu_open = false
 ashita.events.register('load', 'chatter_load', function()
     renderer.initialize(addon.path)
     renderer.set_theme(config.theme)
-    renderer.set_layout_history_lines(config.layout_history_lines or 50)
     renderer.update_style(
         config.font_family,
         config.font_size,
@@ -277,16 +279,23 @@ ashita.events.register('load', 'chatter_load', function()
     renderer.set_background_color(color_to_argb(bg_col))
     renderer.set_border_color(color_to_argb(bd_col))
     
+    -- Load History
+    chatmanager.load_history(addon.path .. 'chathistory.lua')
+    
     -- Load welcome message
     chatmanager.add_line("Chatter v2.0 Initialized.", 0xFF00FF00)
     chatmanager.add_line("Engine: Ashita Fonts + ImGui Window", 0xFFFFFF00)
     
-    -- Add test lines to demonstrate scrolling
-    for i = 1, 100 do
-        chatmanager.add_line("History Line #" .. i .. ": This is a test of the new lag-free rendering engine.", 0xFFDDDDDD)
+    -- Debug: Add 200 lines of fake chat history
+    for i = 1, 200 do
+        chatmanager.add_line("Debug Line #" .. i .. ": Checking performance with fake history.", 0xFFCCCCCC)
     end
-    chatmanager.add_line("Scroll up to see history!", 0xFF00FFFF)
 end)
+
+-- Unload
+-- ashita.events.register('unload', 'chatter_unload', function()
+--     chatmanager.save_history(addon.path .. 'chathistory.lua')
+-- end)
 
 -- ImGui Rendering
 ashita.events.register('d3d_present', 'chatter_render_ui', function()
@@ -389,7 +398,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
             elseif is_resizing and not imgui.IsMouseDown(0) then
                 is_resizing = false
                 renderer.set_resizing(false)
-                settings.save()
+                request_save()
             end
 
             if imgui.IsMouseClicked(0) and shift_down and not in_resize_zone and not is_resizing and not config.lock_window then
@@ -407,7 +416,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                 config.window_y = new_y
             elseif is_dragging and (not imgui.IsMouseDown(0) or not shift_down) then
                 is_dragging = false
-                settings.save()
+                request_save()
             end
 
             if not is_dragging and not is_resizing then
@@ -421,8 +430,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                         if index >= 1 and index <= page_size then
                             local line_index, seg_start, seg_end = renderer.get_view_line(index)
                             if line_index then
-                                local line = chatmanager.lines[line_index]
-                                local full_text = line and line.text or ""
+                                local full_text = chatmanager.get_line_text(line_index) or ""
                                 local segment_text = ""
                                 if full_text ~= "" and seg_start <= #full_text then
                                     local seg_end_clamped = math.min(seg_end, #full_text)
@@ -460,8 +468,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                     local current_pos = nil
 
                     if line_index then
-                        local line = chatmanager.lines[line_index]
-                        local full_text = line and line.text or ""
+                        local full_text = chatmanager.get_line_text(line_index) or ""
                         local segment_text = ""
                         if full_text ~= "" and seg_start <= #full_text then
                             local seg_end_clamped = math.min(seg_end, #full_text)
@@ -504,6 +511,10 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
         end
     end
     imgui.End()
+    if save_pending and (os.clock() - last_save_request) >= SAVE_DEBOUNCE_SEC then
+        settings.save()
+        save_pending = false
+    end
 end)
 
 
@@ -584,32 +595,32 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 local lines = {}
                 -- If single line selection
                 if start_sel.line == end_sel.line then
-                    local line = chatmanager.lines[start_sel.line]
-                    if line and line.text then
+                    local text = chatmanager.get_line_text(start_sel.line)
+                    if text then
                         local s = math.max(1, start_sel.char)
-                        local e = math.min(#line.text, end_sel.char)
-                        s, e = extend_end_to_word(line.text, s, e)
+                        local e = math.min(#text, end_sel.char)
+                        s, e = extend_end_to_word(text, s, e)
                         if s <= e then
-                            table.insert(lines, string.sub(line.text, s, e))
+                            table.insert(lines, string.sub(text, s, e))
                         end
                     end
                 else
                     -- Multi-line
                     for i = start_sel.line, end_sel.line do
-                        local line = chatmanager.lines[i]
-                        if line and line.text then
+                        local text = chatmanager.get_line_text(i)
+                        if text then
                             if i == start_sel.line then
                                 local s = math.max(1, start_sel.char)
-                                local e = #line.text
-                                s, e = extend_end_to_word(line.text, s, e)
-                                table.insert(lines, string.sub(line.text, s, e))
+                                local e = #text
+                                s, e = extend_end_to_word(text, s, e)
+                                table.insert(lines, string.sub(text, s, e))
                             elseif i == end_sel.line then
-                                local e = math.min(#line.text, end_sel.char)
+                                local e = math.min(#text, end_sel.char)
                                 local s = 1
-                                s, e = extend_end_to_word(line.text, s, e)
-                                table.insert(lines, string.sub(line.text, 1, e))
+                                s, e = extend_end_to_word(text, s, e)
+                                table.insert(lines, string.sub(text, 1, e))
                             else
-                                table.insert(lines, line.text)
+                                table.insert(lines, text)
                             end
                         end
                     end
@@ -771,7 +782,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         if imgui.Selectable(name, selected) then
                             config.theme = name
                             renderer.set_theme(name)
-                            settings.save()
+                            request_save()
                         end
                         if selected then
                             imgui.SetItemDefaultFocus()
@@ -783,26 +794,19 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 local pad_x_buf = { config.padding_x or 0 }
                 if imgui.SliderInt("Window Padding X", pad_x_buf, 0, 64) then
                     config.padding_x = pad_x_buf[1]
-                    settings.save()
+                    request_save()
                 end
 
                 local pad_y_buf = { config.padding_y or 0 }
                 if imgui.SliderInt("Window Padding Y", pad_y_buf, 0, 64) then
                     config.padding_y = pad_y_buf[1]
-                    settings.save()
-                end
-
-                local history_buf = { config.layout_history_lines or 50 }
-                if imgui.SliderInt("Wrap History Lines", history_buf, 10, chatmanager.max_lines or 5000) then
-                    config.layout_history_lines = history_buf[1]
-                    renderer.set_layout_history_lines(config.layout_history_lines)
-                    settings.save()
+                    request_save()
                 end
 
                 local lock_val = { config.lock_window }
                 if imgui.Checkbox("Lock Window (Hide Resize Icon)", lock_val) then
                     config.lock_window = lock_val[1]
-                    settings.save()
+                    request_save()
                 end
 
                 imgui.EndTabItem()
@@ -814,7 +818,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 if imgui.ColorEdit4("Background Color", bg_val) then
                     config.background_color = bg_val
                     renderer.set_background_color(color_to_argb(bg_val))
-                    settings.save()
+                    request_save()
                 end
 
                 local bd_col = config.border_color or {1.0, 1.0, 1.0, 1.0}
@@ -822,7 +826,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 if imgui.ColorEdit4("Border Color", bd_val) then
                     config.border_color = bd_val
                     renderer.set_border_color(color_to_argb(bd_val))
-                    settings.save()
+                    request_save()
                 end
 
                 imgui.EndTabItem()
@@ -852,7 +856,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         config.outline_enabled,
                         color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
                     )
-                    settings.save()
+                    request_save()
                 end
                 
                 if imgui.BeginCombo("Font Family", current_font) then
@@ -867,7 +871,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                                 config.font_italic,
                                 config.outline_enabled
                             )
-                            settings.save()
+                            request_save()
                         end
                         if selected then
                             imgui.SetItemDefaultFocus()
@@ -889,7 +893,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         config.outline_enabled,
                         color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
                     )
-                    settings.save()
+                    request_save()
                 end
                 
                 local bold_val = { config.font_bold }
@@ -903,7 +907,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         config.outline_enabled,
                         color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
                     )
-                    settings.save()
+                    request_save()
                 end
                 
                 local italic_val = { config.font_italic }
@@ -917,7 +921,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         config.outline_enabled,
                         color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
                     )
-                    settings.save()
+                    request_save()
                 end
                 
                 local outline_val = { config.outline_enabled }
@@ -931,7 +935,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         config.outline_enabled,
                         color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
                     )
-                    settings.save()
+                    request_save()
                 end
 
                 imgui.EndTabItem()
@@ -965,7 +969,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                                 config.outline_enabled,
                                 color_to_argb(outline_val)
                             )
-                            settings.save()
+                            request_save()
                         end
                     end
 
@@ -1010,6 +1014,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
 end)
 
 ashita.events.register('unload', 'chatter_unload', function()
+    chatmanager.save_history(addon.path .. 'chathistory.lua')
     renderer.dispose()
 end)
 

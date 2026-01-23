@@ -5,6 +5,18 @@ local chatmanager = require('core.chatmanager')
 local gdi = require('submodules.gdifonts.include')
 local bit = require('bit')
 
+-- Localize global functions for performance
+local math_floor = math.floor
+local math_ceil = math.ceil
+local math_max = math.max
+local math_min = math.min
+local math_abs = math.abs
+local string_sub = string.sub
+local string_format = string.format
+local string_byte = string.byte
+local table_insert = table.insert
+local table_remove = table.remove
+
 local measurement_cache = {}
 
 local CachedFont = {}
@@ -13,6 +25,7 @@ CachedFont.__index = CachedFont
 function CachedFont.new(font_obj)
     local self = setmetatable({}, CachedFont)
     self.font = font_obj
+    self.current_key = nil
     self.cache = {
         text = nil,
         color = nil,
@@ -107,9 +120,56 @@ function CachedFont:get_font_height()
 end
 
 local font_pool = {}
+local font_cache = {}
 local pool_size = 50
 local font_height = 14
-local layout_lines = {}
+
+-- Layout Store (SoA)
+local layout_store = {
+    line_index = {},
+    start_char = {},
+    end_char = {},
+    key = {},
+    segment_text = {}
+}
+
+-- Reusable buffers to avoid GC
+local layout_buffer = {
+    line_index = {},
+    start_char = {},
+    end_char = {},
+    key = {},
+    segment_text = {}
+}
+local line_segments_buffer = {
+    start_char = {},
+    end_char = {}
+}
+
+local assignments = {}
+local available_fonts = {}
+local visible_slot_line = {}
+local visible_slot_start = {}
+local visible_slot_end = {}
+local visible_slot_key = {}
+local free_list = {}
+local last_visible_count = 0
+local background_dirty = true
+local layout_task = nil
+local layout_rebuild_mode = 'immediate'
+local layout_lines_per_frame = 8
+local last_layout_time = 0
+local LAYOUT_THROTTLE_DELAY = 0.05
+local layout_use_task = false
+local begin_layout_task
+local MAX_LINES_PER_FRAME = 64
+local MIN_LINES_PER_FRAME = 4
+local TARGET_LAYOUT_BUDGET_SEC = 0.004
+local STYLE_UPDATES_PER_FRAME = 8
+local style_updates_pending = false
+local fonts_to_style = {}
+local pending_style = { family = nil, size = nil, flags = nil, outline_color = nil }
+
 local total_visual_lines = 0
 local window_rect = { x = 100, y = 100, w = 600, h = 400 }
 local scroll_offset = 0
@@ -366,7 +426,7 @@ function renderer.initialize(addon_path)
     for i = 1, pool_size do
         local sel_name = 'chatter_sel_bg_' .. i
         local prim = AshitaCore:GetPrimitiveManager():Create(sel_name)
-        prim:SetColor(0x800078D7) -- Semi-transparent Blue
+        prim:SetColor(0xC00078D7) -- More opaque Blue
         prim:SetPositionX(0)
         prim:SetPositionY(0)
         prim:SetWidth(0)
@@ -374,23 +434,6 @@ function renderer.initialize(addon_path)
         prim:SetLocked(true)
         prim:SetCanFocus(false)
         prim:SetVisible(false)
-        -- Ensure selection is above background but below text (if possible, though font manager usually renders last)
-        -- Ashita's PrimitiveManager usually renders in creation order unless z-ordering is manually managed?
-        -- Actually, Font objects are managed by FontManager which renders separately.
-        -- Primitives are rendered by PrimitiveManager.
-        -- Usually Primitives are rendered before Fonts.
-        -- If selection background is not showing, it might be behind the main background window?
-        -- Let's ensure Z-order by recreating if needed or just assuming order.
-        -- Actually, the issue might be that we created the BG *before* the selection, so BG is drawn first (bottom), then Selection (top).
-        -- Wait, if BG is drawn first, then Selection is drawn on top of BG. That is correct.
-        -- However, if the user says "not seeing the background", maybe the alpha blending is wrong or it's being culled?
-        -- Or maybe the text is drawing OVER it (which is good) but the color is too faint?
-        -- Let's try to increase opacity slightly or check if it's being drawn at all.
-        -- Another possibility: Texture BG might be drawing over selection if we re-set texture?
-        -- No, we created bg_tex_primitive BEFORE selection_prims. So selection_prims should be ON TOP of bg_tex_primitive.
-        
-        -- Let's try setting a higher alpha to be sure.
-        prim:SetColor(0xC00078D7) -- More opaque Blue
         
         table.insert(selection_prims, prim)
     end
@@ -448,6 +491,7 @@ end
 
 function renderer.set_theme(theme_name)
     current_theme = theme_name or 'Plain'
+    background_dirty = true
 
     if current_theme == '-None-' then
         if bg_primitive then bg_primitive:SetVisible(false) end
@@ -474,7 +518,6 @@ function renderer.set_theme(theme_name)
             end
         end
     else
-        -- local xiui_path = get_xiui_addon_path() -- Deprecated
         local tex_path = string.format('%sassets\\backgrounds\\%s-bg.png', addon_path_cache, current_theme)
         if bg_tex_primitive then
             bg_tex_primitive:SetTextureFromFile(tex_path)
@@ -495,7 +538,10 @@ function renderer.set_theme(theme_name)
         end
     end
 
-    update_background_geometry()
+    if background_dirty then
+        update_background_geometry()
+        background_dirty = false
+    end
 end
 
 function renderer.update_geometry(x, y, w, h)
@@ -518,14 +564,30 @@ function renderer.update_geometry(x, y, w, h)
         is_render_dirty = true
     end
 
-    update_background_geometry()
+    if width_changed or height_changed or pos_changed then
+        background_dirty = true
+    end
+    if background_dirty then
+        update_background_geometry()
+        background_dirty = false
+    end
+    if is_resizing and width_changed then
+        layout_task = nil
+        layout_use_task = false
+        is_layout_dirty = true
+        is_render_dirty = true
+    end
 end
 
 function renderer.set_resizing(flag)
     if flag then
         is_resizing = true
+        layout_task = nil
+        layout_use_task = false
+        is_layout_dirty = true
     else
         is_resizing = false
+        layout_task = nil
         is_layout_dirty = true
     end
 end
@@ -553,7 +615,8 @@ function renderer.set_border_color(color)
 end
 
 function renderer.get_content_height()
-    return math.max(1, total_visual_lines * (font_height + LINE_SPACING))
+    -- Estimate content height for scrollbar
+    return math.max(1, chatmanager.count * (font_height + LINE_SPACING))
 end
 
 function renderer.get_window_rect()
@@ -570,28 +633,10 @@ function renderer.get_visible_line_count()
 end
 
 function renderer.get_view_line(view_index)
-    local page_size = renderer.get_page_size()
-    local visible_count = math.min(pool_size, page_size)
-    if total_visual_lines == 0 then
+    if view_index < 1 or view_index > #layout_store.line_index then
         return nil
     end
-    if view_index < 1 or view_index > visible_count then
-        return nil
-    end
-    local end_index = total_visual_lines - scroll_offset
-    if end_index < 1 then
-        end_index = 1
-    end
-    local start_index = end_index - visible_count + 1
-    if start_index < 1 then
-        start_index = 1
-    end
-    local visual_index = start_index + view_index - 1
-    local layout = layout_lines[visual_index]
-    if not layout then
-        return nil
-    end
-    return layout.line_index, layout.start_char, layout.end_char
+    return layout_store.line_index[view_index], layout_store.start_char[view_index], layout_store.end_char[view_index]
 end
 
 function renderer.set_selection(start_abs, end_abs)
@@ -604,13 +649,12 @@ function renderer.update_scroll(delta)
     scroll_offset = scroll_offset + delta
     if scroll_offset < 0 then scroll_offset = 0 end
     
-    local page_size = renderer.get_page_size()
-    local max_scroll = 0
-    if total_visual_lines > page_size then
-        max_scroll = total_visual_lines - page_size
-    end
+    local max_scroll = chatmanager.count
+    if max_scroll < 0 then max_scroll = 0 end
+    
     if scroll_offset > max_scroll then scroll_offset = max_scroll end
     
+    is_layout_dirty = true
     is_render_dirty = true
 end
 
@@ -633,119 +677,326 @@ local function measure_text(text)
     return w
 end
 
-local function compute_wrap_length(text, max_width)
+local function compute_wrap_length(text, start_pos, max_width)
     if not text or text == "" then
         return 0
     end
-    if max_width <= 0 then
-        return #text
-    end
+    
     local len = #text
+    if start_pos > len then
+        return 0
+    end
+    
+    local available = len - start_pos + 1
+    if max_width <= 0 then
+        return available
+    end
+
+    -- Optimization: Check if the rest of the string fits (up to a reasonable limit)
+    -- This avoids binary search for short lines (common case) and massive allocs for huge lines.
+    local limit = 1000
+    local check_len = math_min(available, limit)
+    
+    -- We must measure the chunk to know if it fits.
+    local check_chunk = string_sub(text, start_pos, start_pos + check_len - 1)
+    local check_w = measure_text(check_chunk)
+    
+    if check_w <= max_width then
+        -- If the checked chunk fits, and it was the whole available text, return it.
+        if available <= limit then
+            return available
+        end
+        -- If we have more text than the limit, but the limit chunk fits, 
+        -- we can safely return 'limit'. The next iteration will handle the rest.
+        return limit
+    end
+
+    -- Binary search for the split point within [1, check_len]
     local low = 1
-    local high = len
-    local best = len
+    local high = check_len
+    local best = 1
+    
     while low <= high do
-        local mid = math.floor((low + high) / 2)
-        local chunk = text:sub(1, mid)
+        local mid = math_floor((low + high) / 2)
+        local chunk = string_sub(text, start_pos, start_pos + mid - 1)
         local w = measure_text(chunk)
         if w > max_width then
-            best = mid - 1
             high = mid - 1
         else
+            best = mid
             low = mid + 1
         end
     end
-    if best < 1 then
-        best = 1
-    end
-    if best >= len then
-        return len
-    end
-    local last_space = 0
-    for i = 1, best do
-        local c = text:sub(i, i)
-        if c == ' ' or c == '\t' then
-            last_space = i
+    
+    -- Word wrap logic: Backtrack to last space if we are splitting the line
+    if best < available then
+        for i = best, 1, -1 do
+            local b = string.byte(text, start_pos + i - 1)
+            if b == 32 or b == 9 then -- space or tab
+                return i
+            end
         end
     end
-    if last_space > 0 then
-        return last_space
-    end
+    
     return best
 end
 
 local MAX_PAGE_MULTIPLIER = 4
-local max_source_lines = 50
-
-function renderer.set_layout_history_lines(n)
-    if type(n) ~= 'number' then
-        return
-    end
-    if n < 10 then
-        n = 10
-    end
-    if n > chatmanager.max_lines then
-        n = chatmanager.max_lines
-    end
-    max_source_lines = math.floor(n + 0.5)
-    is_layout_dirty = true
-end
 
 local function append_layout_for_range(start_idx, end_idx)
-    local lines = chatmanager.lines
-    local max_text_width = window_rect.w - (PADDING * 2)
-    if max_text_width <= 0 then
-        max_text_width = 1
-    end
+    -- Deprecated in favor of lazy layout
+end
 
-    for idx = start_idx, end_idx do
-        local line = lines[idx]
-        local text = line and line.text or ""
+local function update_visible_layout()
+    local lb_idx = 0
+    
+    local max_text_width = window_rect.w - (PADDING * 2)
+    if max_text_width <= 0 then max_text_width = 1 end
+    
+    local page_size = renderer.get_page_size()
+    local visible_count = math.min(pool_size, page_size)
+    local layout_limit = math.max(100, page_size * 2)
+    if is_resizing then
+        layout_limit = math_max(visible_count, page_size)
+    end
+    
+    local anchor_idx = chatmanager.count - math.floor(scroll_offset)
+    if anchor_idx > chatmanager.count then anchor_idx = chatmanager.count end
+    if anchor_idx < 1 then 
+        total_visual_lines = 0
+        render_start_index = 1
+        for i = 1, #layout_store.line_index do
+            layout_store.line_index[i] = nil
+            layout_store.start_char[i] = nil
+            layout_store.end_char[i] = nil
+            layout_store.key[i] = nil
+            layout_store.segment_text[i] = nil
+        end
+        return 
+    end
+    
+    local visual_lines_generated = 0
+    local current_idx = anchor_idx
+    
+    -- Safety limit
+    local loop_limit = 200 
+    if is_resizing then
+        loop_limit = math_max(visible_count, page_size)
+    end
+    local loops = 0
+    
+    while current_idx >= 1 and visual_lines_generated < layout_limit and loops < loop_limit do
+        local text = chatmanager.get_line_text(current_idx) or ""
         local len = #text
+        local line_id = chatmanager.get_line_id(current_idx)
+        
+        -- Reuse line_segments_buffer
+        local seg_count = 0
+        
         if len == 0 then
-            table.insert(layout_lines, {
-                line_index = idx,
-                start_char = 1,
-                end_char = 0,
-            })
+            seg_count = 1
+            line_segments_buffer.start_char[1] = 1
+            line_segments_buffer.end_char[1] = 0
         else
             local pos = 1
-            while pos <= len do
-                local remaining = text:sub(pos)
-                local slice_len = compute_wrap_length(remaining, max_text_width)
-                if slice_len <= 0 then
-                    slice_len = len - pos + 1
+                while pos <= len do
+                    local slice_len = compute_wrap_length(text, pos, max_text_width)
+                    if slice_len <= 0 then slice_len = len - pos + 1 end
+                    
+                    seg_count = seg_count + 1
+                    line_segments_buffer.start_char[seg_count] = pos
+                    line_segments_buffer.end_char[seg_count] = pos + slice_len - 1
+                    
+                    pos = pos + slice_len
                 end
-                local start_char = pos
-                local end_char = pos + slice_len - 1
-                table.insert(layout_lines, {
-                    line_index = idx,
-                    start_char = start_char,
-                    end_char = end_char,
-                })
-                pos = end_char + 1
-            end
         end
+        
+        for i = seg_count, 1, -1 do
+            lb_idx = lb_idx + 1
+            layout_buffer.line_index[lb_idx] = current_idx
+            layout_buffer.start_char[lb_idx] = line_segments_buffer.start_char[i]
+            layout_buffer.end_char[lb_idx] = line_segments_buffer.end_char[i]
+            local s = layout_buffer.start_char[lb_idx]
+            local e = layout_buffer.end_char[lb_idx]
+            if line_id then
+                layout_buffer.key[lb_idx] = line_id .. ':' .. s .. ':' .. e
+            else
+                layout_buffer.key[lb_idx] = nil
+            end
+            if text ~= "" and s <= len then
+                local ee = math_min(e, len)
+                layout_buffer.segment_text[lb_idx] = string_sub(text, s, ee)
+            else
+                layout_buffer.segment_text[lb_idx] = ""
+            end
+            visual_lines_generated = visual_lines_generated + 1
+        end
+        
+        current_idx = current_idx - 1
+        loops = loops + 1
     end
-    total_visual_lines = #layout_lines
+    
+    local store_idx = 0
+    for i = lb_idx, 1, -1 do
+        store_idx = store_idx + 1
+        layout_store.line_index[store_idx] = layout_buffer.line_index[i]
+        layout_store.start_char[store_idx] = layout_buffer.start_char[i]
+        layout_store.end_char[store_idx] = layout_buffer.end_char[i]
+        layout_store.key[store_idx] = layout_buffer.key[i]
+        layout_store.segment_text[store_idx] = layout_buffer.segment_text[i]
+    end
+    
+    for i = store_idx + 1, #layout_store.line_index do
+        layout_store.line_index[i] = nil
+        layout_store.start_char[i] = nil
+        layout_store.end_char[i] = nil
+        layout_store.key[i] = nil
+        layout_store.segment_text[i] = nil
+    end
+    
+    total_visual_lines = store_idx
+    
+    local visible_count = math.min(pool_size, page_size)
+    if total_visual_lines > visible_count then
+        render_start_index = total_visual_lines - visible_count + 1
+    else
+        render_start_index = 1
+    end
+    background_dirty = true
 end
 
 local function rebuild_layout()
-    layout_lines = {}
-    local count = #chatmanager.lines
-    if count > 0 then
-        local max_source = max_source_lines
-        if max_source > count then
-            max_source = count
-        end
-        local start_idx = count - max_source + 1
-        if start_idx < 1 then
-            start_idx = 1
-        end
-        append_layout_for_range(start_idx, count)
-    else
-        total_visual_lines = 0
+    local now = os.clock()
+    if not is_resizing and (now - last_layout_time) < LAYOUT_THROTTLE_DELAY then
+        return
     end
+    update_visible_layout()
+    last_layout_time = now
+end
+
+function begin_layout_task()
+    local max_text_width = window_rect.w - (PADDING * 2)
+    if max_text_width <= 0 then max_text_width = 1 end
+    local page_size = renderer.get_page_size()
+    local layout_limit = math.max(100, page_size * 2)
+    local anchor_idx = chatmanager.count - math.floor(scroll_offset)
+    if anchor_idx > chatmanager.count then anchor_idx = chatmanager.count end
+    layout_task = {
+        max_text_width = max_text_width,
+        layout_limit = layout_limit,
+        current_idx = anchor_idx,
+        lb_idx = 0,
+        visual_lines_generated = 0,
+        loops = 0,
+        loop_limit = 200
+    }
+end
+
+local function step_layout_task()
+    local task = layout_task
+    if not task then return true end
+    local lines_processed = 0
+    task.max_text_width = math_max(1, window_rect.w - (PADDING * 2))
+    if task.current_idx < 1 then
+        total_visual_lines = 0
+        render_start_index = 1
+        for i = 1, #layout_store.line_index do
+            layout_store.line_index[i] = nil
+            layout_store.start_char[i] = nil
+            layout_store.end_char[i] = nil
+            layout_store.key[i] = nil
+            layout_store.segment_text[i] = nil
+        end
+        layout_task = nil
+        is_layout_dirty = false
+        background_dirty = true
+        return true
+    end
+
+    while task.current_idx >= 1
+        and task.visual_lines_generated < task.layout_limit
+        and task.loops < task.loop_limit
+        and lines_processed < layout_lines_per_frame do
+        local text = chatmanager.get_line_text(task.current_idx) or ""
+        local len = #text
+        local line_id = chatmanager.get_line_id(task.current_idx)
+        local seg_count = 0
+
+        if len == 0 then
+            seg_count = 1
+            line_segments_buffer.start_char[1] = 1
+            line_segments_buffer.end_char[1] = 0
+        else
+            local pos = 1
+            while pos <= len do
+                local slice_len = compute_wrap_length(text, pos, task.max_text_width)
+                if slice_len <= 0 then slice_len = len - pos + 1 end
+                seg_count = seg_count + 1
+                line_segments_buffer.start_char[seg_count] = pos
+                line_segments_buffer.end_char[seg_count] = pos + slice_len - 1
+                pos = pos + slice_len
+            end
+        end
+
+        for i = seg_count, 1, -1 do
+            task.lb_idx = task.lb_idx + 1
+            layout_buffer.line_index[task.lb_idx] = task.current_idx
+            layout_buffer.start_char[task.lb_idx] = line_segments_buffer.start_char[i]
+            layout_buffer.end_char[task.lb_idx] = line_segments_buffer.end_char[i]
+            local s = layout_buffer.start_char[task.lb_idx]
+            local e = layout_buffer.end_char[task.lb_idx]
+            if line_id then
+                layout_buffer.key[task.lb_idx] = line_id .. ':' .. s .. ':' .. e
+            else
+                layout_buffer.key[task.lb_idx] = nil
+            end
+            if text ~= "" and s <= len then
+                local ee = math_min(e, len)
+                layout_buffer.segment_text[task.lb_idx] = string_sub(text, s, ee)
+            else
+                layout_buffer.segment_text[task.lb_idx] = ""
+            end
+            task.visual_lines_generated = task.visual_lines_generated + 1
+        end
+
+        task.current_idx = task.current_idx - 1
+        task.loops = task.loops + 1
+        lines_processed = lines_processed + 1
+    end
+
+    if task.current_idx < 1
+        or task.visual_lines_generated >= task.layout_limit
+        or task.loops >= task.loop_limit then
+        local store_idx = 0
+        for i = task.lb_idx, 1, -1 do
+            store_idx = store_idx + 1
+            layout_store.line_index[store_idx] = layout_buffer.line_index[i]
+            layout_store.start_char[store_idx] = layout_buffer.start_char[i]
+            layout_store.end_char[store_idx] = layout_buffer.end_char[i]
+            layout_store.key[store_idx] = layout_buffer.key[i]
+            layout_store.segment_text[store_idx] = layout_buffer.segment_text[i]
+        end
+        for i = store_idx + 1, #layout_store.line_index do
+            layout_store.line_index[i] = nil
+            layout_store.start_char[i] = nil
+            layout_store.end_char[i] = nil
+            layout_store.key[i] = nil
+            layout_store.segment_text[i] = nil
+        end
+        total_visual_lines = store_idx
+        local visible_count = math.min(pool_size, renderer.get_page_size())
+        if total_visual_lines > visible_count then
+            render_start_index = total_visual_lines - visible_count + 1
+        else
+            render_start_index = 1
+        end
+        layout_task = nil
+        is_layout_dirty = false
+        background_dirty = true
+        return true
+    end
+
+    return false
 end
 
 function renderer.update_style(family, size, bold, italic, outline_enabled, outline_argb)
@@ -767,15 +1018,22 @@ function renderer.update_style(family, size, bold, italic, outline_enabled, outl
     if italic then
         flags = bit.bor(flags, gdi.FontFlags.Italic)
     end
-    
-    for _, font in ipairs(font_pool) do
-        if font then
-            font:set_font_family(family)
-            font:set_font_height(size)
-            font:set_font_flags(flags)
-            font:set_outline_color(outline_color)
+    pending_style.family = family
+    pending_style.size = size
+    pending_style.flags = flags
+    pending_style.outline_color = outline_color
+    local q = 0
+    for i = 1, #font_pool do
+        local f = font_pool[i]
+        if f then
+            q = q + 1
+            fonts_to_style[q] = f
         end
     end
+    for i = q + 1, #fonts_to_style do
+        fonts_to_style[i] = nil
+    end
+    style_updates_pending = true
     if measure_font then
         measure_font:set_font_family(family)
         measure_font:set_font_height(size)
@@ -784,6 +1042,8 @@ function renderer.update_style(family, size, bold, italic, outline_enabled, outl
     end
     -- calibrate_measurement(family, size, bold, italic) -- Deprecated
 
+    layout_task = nil
+    layout_use_task = true
     is_layout_dirty = true
 end
 
@@ -795,6 +1055,11 @@ function renderer.update_fonts()
     local page_size = renderer.get_page_size()
     local visible_count = math.min(pool_size, page_size)
     -- rebuild_layout called separately
+    if is_layout_dirty and layout_task == nil and not layout_use_task then
+        update_visible_layout()
+        is_layout_dirty = false
+    end
+    
     if total_visual_lines == 0 then
         for i = 1, pool_size do
             local font = font_pool[i]
@@ -807,15 +1072,25 @@ function renderer.update_fonts()
         return
     end
 
-    local end_index = total_visual_lines - scroll_offset
-    if end_index < 1 then
-        end_index = 1
-    end
-    local start_index = end_index - visible_count + 1
-    if start_index < 1 then
-        start_index = 1
-    end
-
+    -- With virtual layout, we just render everything in layout_store from start
+    -- because layout_store ONLY contains what fits on screen (or slightly more)
+    
+    local start_index = render_start_index
+    -- local end_index = math.min(total_visual_lines, visible_count) -- Unused
+    
+    -- If we have fewer lines than page_size, we might need to adjust start_y 
+    -- to stick to bottom?
+    -- Standard terminal behavior: if few lines, start from top.
+    -- If we want to stick to bottom when < page_size, we add padding.
+    -- But our loop generated lines bottom-up.
+    -- If we generated 5 lines but page_size is 20:
+    -- Buffer has 5 lines. They are lines N-4, N-3, N-2, N-1, N.
+    -- We render them at top of screen?
+    -- Usually chat starts at bottom.
+    -- Let's stick to top for now as it's standard for scrolling up.
+    -- Actually, if we are at bottom of history, we usually want them at bottom of screen?
+    -- Let's stick to top-down rendering of the buffer.
+    
     local start_x = window_rect.x + PADDING
     local start_y = window_rect.y + PADDING
     local max_text_width = window_rect.w - (PADDING * 2)
@@ -847,102 +1122,189 @@ function renderer.update_fonts()
         end
     end
     
-    for i = 1, pool_size do
-        local font = font_pool[i]
-        local sel_prim = selection_prims[i]
-        if i <= visible_count then
-            local visual_index = start_index + i - 1
-            local layout = layout_lines[visual_index]
-            if layout then
-                local line = chatmanager.lines[layout.line_index]
-                local full_text = line and line.text or ""
-                local segment_text = ""
-                if full_text ~= "" and layout.start_char <= #full_text then
-                    local seg_end = math.min(layout.end_char, #full_text)
-                    segment_text = full_text:sub(layout.start_char, seg_end)
-                end
-                local color = line and line.color or 0xFFFFFFFF
-                local is_selected = false
-                local sel_x_start = 0
-                local sel_x_width = 0
-
-                if sel_start_line and sel_end_line and segment_text ~= "" then
-                    local line_index = layout.line_index
-                    local seg_start = layout.start_char
-                    local seg_end = layout.end_char
-                    if seg_end > #full_text then
-                        seg_end = #full_text
+    for k in pairs(available_fonts) do
+        available_fonts[k] = nil
+    end
+    for i = 1, visible_count do
+        assignments[i] = nil
+        visible_slot_line[i] = nil
+        visible_slot_start[i] = nil
+        visible_slot_end[i] = nil
+        visible_slot_key[i] = nil
+    end
+    for i = visible_count + 1, last_visible_count do
+        assignments[i] = nil
+        visible_slot_line[i] = nil
+        visible_slot_start[i] = nil
+        visible_slot_end[i] = nil
+        visible_slot_key[i] = nil
+    end
+    last_visible_count = visible_count
+    
+    for i = 1, #font_pool do
+        available_fonts[font_pool[i]] = true
+    end
+    
+    -- Pass 1: Identify visible slots and try to match with cache
+    -- Note: chatmanager data is a ring buffer, so we must use accessor functions
+    -- instead of direct array access.
+    
+    for i = 1, visible_count do
+        local visual_index = start_index + i - 1
+        
+        -- Bounds check
+        if visual_index <= #layout_store.line_index then
+            local line_idx = layout_store.line_index[visual_index]
+            local start_c = layout_store.start_char[visual_index]
+            local end_c = layout_store.end_char[visual_index]
+            
+            if line_idx then
+                local key = layout_store.key[visual_index]
+                if not key then
+                    local line_id = chatmanager.get_line_id(line_idx)
+                    if line_id then
+                        key = line_id .. ':' .. start_c .. ':' .. end_c
                     end
-                    if seg_start <= seg_end then
-                        if line_index >= sel_start_line and line_index <= sel_end_line then
-                            local sel_seg_start = seg_start
-                            local sel_seg_end = seg_end
-                            if line_index == sel_start_line then
-                                if sel_start_char > sel_seg_start then
-                                    sel_seg_start = sel_start_char
-                                end
+                end
+                visible_slot_line[i] = line_idx
+                visible_slot_start[i] = start_c
+                visible_slot_end[i] = end_c
+                visible_slot_key[i] = key
+                
+                if key then
+                    local cached = font_cache[key]
+                    if cached and available_fonts[cached] then
+                        assignments[i] = cached
+                        available_fonts[cached] = nil
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Pass 2: Assign remaining slots from free pool
+    local free_count = 0
+    for f, _ in pairs(available_fonts) do
+        free_count = free_count + 1
+        free_list[free_count] = f
+    end
+    for i = free_count + 1, #free_list do
+        free_list[i] = nil
+    end
+    local free_idx = 1
+    
+    for i = 1, visible_count do
+        if not assignments[i] and visible_slot_line[i] then
+            local font = free_list[free_idx]
+            free_idx = free_idx + 1
+            if font then
+                assignments[i] = font
+                
+                -- Update cache mapping
+                local key = visible_slot_key[i]
+                if font.current_key and font.current_key ~= key then
+                    font_cache[font.current_key] = nil
+                end
+                font.current_key = key
+                if key then
+                    font_cache[key] = font
+                end
+            end
+        end
+    end
+
+    -- Pass 3: Render and Selection
+    for i = 1, pool_size do
+        local font = assignments[i]
+        local sel_prim = selection_prims[i]
+        
+        if i <= visible_count and font and visible_slot_line[i] then
+            local line_idx = visible_slot_line[i]
+            local start_c = visible_slot_start[i]
+            local end_c = visible_slot_end[i]
+            local segment_text = layout_store.segment_text[start_index + i - 1] or ""
+            local full_text = chatmanager.get_line_text(line_idx) or ""
+            local color = chatmanager.get_line_color(line_idx) or 0xFFFFFFFF
+            local is_selected = false
+            local sel_x_start = 0
+            local sel_x_width = 0
+
+            if sel_start_line and sel_end_line and segment_text ~= "" then
+                local seg_start = start_c
+                local seg_end = end_c
+                if seg_end > #full_text then
+                    seg_end = #full_text
+                end
+                if seg_start <= seg_end then
+                    if line_idx >= sel_start_line and line_idx <= sel_end_line then
+                        local sel_seg_start = seg_start
+                        local sel_seg_end = seg_end
+                        if line_idx == sel_start_line then
+                            if sel_start_char > sel_seg_start then
+                                sel_seg_start = sel_start_char
                             end
-                            if line_index == sel_end_line then
-                                if sel_end_char < sel_seg_end then
-                                    sel_seg_end = sel_end_char
-                                end
+                        end
+                        if line_idx == sel_end_line then
+                            if sel_end_char < sel_seg_end then
+                                sel_seg_end = sel_end_char
                             end
-                            if line_index > sel_start_line and line_index < sel_end_line then
-                                sel_seg_start = seg_start
-                                sel_seg_end = seg_end
+                        end
+                        if line_idx > sel_start_line and line_idx < sel_end_line then
+                            sel_seg_start = seg_start
+                            sel_seg_end = seg_end
+                        end
+                        if sel_seg_start <= sel_seg_end then
+                            local rel_start = sel_seg_start - seg_start + 1
+                            local rel_end = sel_seg_end - seg_start + 1
+                            if rel_start < 1 then
+                                rel_start = 1
                             end
-                            if sel_seg_start <= sel_seg_end then
-                                local rel_start = sel_seg_start - seg_start + 1
-                                local rel_end = sel_seg_end - seg_start + 1
-                                if rel_start < 1 then
-                                    rel_start = 1
+                            if rel_end > #segment_text then
+                                rel_end = #segment_text
+                            end
+                            if rel_start <= rel_end then
+                                local text_before = segment_text:sub(1, rel_start - 1)
+                                local text_incl = segment_text:sub(1, rel_end)
+                                sel_x_start = measure_text(text_before)
+                                sel_x_width = measure_text(text_incl) - sel_x_start
+                                if sel_x_width <= 0 then
+                                    sel_x_width = measure_text(segment_text)
                                 end
-                                if rel_end > #segment_text then
-                                    rel_end = #segment_text
-                                end
-                                if rel_start <= rel_end then
-                                    local text_before = segment_text:sub(1, rel_start - 1)
-                                    local text_incl = segment_text:sub(1, rel_end)
-                                    sel_x_start = measure_text(text_before)
-                                    sel_x_width = measure_text(text_incl) - sel_x_start
-                                    if sel_x_width <= 0 then
-                                        sel_x_width = measure_text(segment_text)
-                                    end
-                                    is_selected = true
-                                end
+                                is_selected = true
                             end
                         end
                     end
                 end
-
-                if is_selected then
-                    color = 0xFFFFFFFF
-                    if sel_prim then
-                        sel_prim:SetPositionX(start_x + sel_x_start)
-                        sel_prim:SetPositionY(start_y + (i-1) * (font_height + LINE_SPACING) + 2)
-                        sel_prim:SetWidth(sel_x_width)
-                        sel_prim:SetHeight(font_height + 1)
-                        sel_prim:SetVisible(true)
-                    end
-                else
-                    if sel_prim then
-                        sel_prim:SetVisible(false)
-                    end
-                end
-
-                font:set_text(segment_text)
-                font:set_font_color(color)
-                font:set_position_x(start_x)
-                font:set_position_y(start_y + (i-1) * (font_height + LINE_SPACING))
-                font:set_visible(true)
-            else
-                font:set_visible(false)
-                if sel_prim then sel_prim:SetVisible(false) end
             end
+
+            if is_selected then
+                color = 0xFFFFFFFF
+                if sel_prim then
+                    sel_prim:SetPositionX(start_x + sel_x_start)
+                    sel_prim:SetPositionY(start_y + (i-1) * (font_height + LINE_SPACING) + 2)
+                    sel_prim:SetWidth(sel_x_width)
+                    sel_prim:SetHeight(font_height + 1)
+                    sel_prim:SetVisible(true)
+                end
+            else
+                if sel_prim then
+                    sel_prim:SetVisible(false)
+                end
+            end
+
+            font:set_text(segment_text)
+            font:set_font_color(color)
+            font:set_position_x(start_x)
+            font:set_position_y(start_y + (i-1) * (font_height + LINE_SPACING))
+            font:set_visible(true)
         else
-            font:set_visible(false)
             if sel_prim then sel_prim:SetVisible(false) end
         end
+    end
+    
+    -- Pass 4: Hide unused fonts
+    for k = free_idx, free_count do
+        free_list[k]:set_visible(false)
     end
     
     -- is_dirty handled by caller
@@ -1024,26 +1386,68 @@ local last_line_count = 0
 function renderer.on_present()
     local current_count = chatmanager.get_line_count()
     if current_count ~= last_line_count then
-        local previous_count = last_line_count
         last_line_count = current_count
 
         if current_count == 0 then
-            layout_lines = {}
+            layout_store.line_index = {}
+            layout_store.start_char = {}
+            layout_store.end_char = {}
             total_visual_lines = 0
             scroll_offset = 0
-            is_render_dirty = true
-        elseif current_count > previous_count and previous_count > 0 and (not is_layout_dirty) and (current_count <= (chatmanager.max_lines or current_count)) then
-            append_layout_for_range(previous_count + 1, current_count)
             is_render_dirty = true
         else
             is_layout_dirty = true
         end
     end
 
-    if is_layout_dirty then
-        rebuild_layout()
+    if style_updates_pending and pending_style.family ~= nil then
+        local applied = 0
+        local i = 1
+        while i <= #fonts_to_style and applied < STYLE_UPDATES_PER_FRAME do
+            local f = fonts_to_style[i]
+            if f then
+                f:set_font_family(pending_style.family)
+                f:set_font_height(pending_style.size)
+                f:set_font_flags(pending_style.flags)
+                f:set_outline_color(pending_style.outline_color)
+            end
+            table_remove(fonts_to_style, i)
+            applied = applied + 1
+        end
+        if #fonts_to_style == 0 then
+            style_updates_pending = false
+        end
         is_render_dirty = true
-        is_layout_dirty = false
+    end
+
+    if is_resizing then
+        if is_layout_dirty then
+            rebuild_layout()
+            is_render_dirty = true
+            is_layout_dirty = false
+        end
+    else
+        if layout_task ~= nil then
+            local t0 = os.clock()
+            step_layout_task()
+            local dt = os.clock() - t0
+            if dt > (TARGET_LAYOUT_BUDGET_SEC * 1.5) then
+                layout_lines_per_frame = math_max(MIN_LINES_PER_FRAME, math_floor(layout_lines_per_frame * 0.7))
+            elseif dt < (TARGET_LAYOUT_BUDGET_SEC * 0.5) then
+                layout_lines_per_frame = math_min(MAX_LINES_PER_FRAME, layout_lines_per_frame + 1)
+            end
+            is_render_dirty = true
+        elseif is_layout_dirty then
+            if layout_use_task then
+                begin_layout_task()
+                layout_use_task = false
+                is_render_dirty = true
+            else
+                rebuild_layout()
+                is_render_dirty = true
+                is_layout_dirty = false
+            end
+        end
     end
 
     if is_render_dirty then
