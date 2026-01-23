@@ -1,7 +1,7 @@
 local renderer = {}
 require('common')
 local d3d = require('d3d8')
-local chat_manager = require('chat_manager')
+local chatmanager = require('core.chatmanager')
 local gdi = require('submodules.gdifonts.include')
 local bit = require('bit')
 
@@ -684,15 +684,15 @@ function renderer.set_layout_history_lines(n)
     if n < 10 then
         n = 10
     end
-    if n > chat_manager.max_lines then
-        n = chat_manager.max_lines
+    if n > chatmanager.max_lines then
+        n = chatmanager.max_lines
     end
     max_source_lines = math.floor(n + 0.5)
     is_layout_dirty = true
 end
 
 local function append_layout_for_range(start_idx, end_idx)
-    local lines = chat_manager.lines
+    local lines = chatmanager.lines
     local max_text_width = window_rect.w - (PADDING * 2)
     if max_text_width <= 0 then
         max_text_width = 1
@@ -732,7 +732,7 @@ end
 
 local function rebuild_layout()
     layout_lines = {}
-    local count = #chat_manager.lines
+    local count = #chatmanager.lines
     if count > 0 then
         local max_source = max_source_lines
         if max_source > count then
@@ -854,7 +854,7 @@ function renderer.update_fonts()
             local visual_index = start_index + i - 1
             local layout = layout_lines[visual_index]
             if layout then
-                local line = chat_manager.lines[layout.line_index]
+                local line = chatmanager.lines[layout.line_index]
                 local full_text = line and line.text or ""
                 local segment_text = ""
                 if full_text ~= "" and layout.start_char <= #full_text then
@@ -1022,7 +1022,7 @@ end
 local last_line_count = 0
 
 function renderer.on_present()
-    local current_count = chat_manager.get_line_count()
+    local current_count = chatmanager.get_line_count()
     if current_count ~= last_line_count then
         local previous_count = last_line_count
         last_line_count = current_count
@@ -1032,7 +1032,7 @@ function renderer.on_present()
             total_visual_lines = 0
             scroll_offset = 0
             is_render_dirty = true
-        elseif current_count > previous_count and previous_count > 0 and (not is_layout_dirty) and (current_count <= (chat_manager.max_lines or current_count)) then
+        elseif current_count > previous_count and previous_count > 0 and (not is_layout_dirty) and (current_count <= (chatmanager.max_lines or current_count)) then
             append_layout_for_range(previous_count + 1, current_count)
             is_render_dirty = true
         else

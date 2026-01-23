@@ -3,7 +3,7 @@ addon.author  = 'NerfOnline'
 addon.version = '0.1'
 
 require('common')
-local chat_manager = require('core.chat_manager')
+local chatmanager = require('core.chatmanager')
 local renderer = require('core.renderer')
 local imgui = require('imgui')
 local settings = require('settings')
@@ -278,14 +278,14 @@ ashita.events.register('load', 'chatter_load', function()
     renderer.set_border_color(color_to_argb(bd_col))
     
     -- Load welcome message
-    chat_manager.add_line("Chatter v2.0 Initialized.", 0xFF00FF00)
-    chat_manager.add_line("Engine: Ashita Fonts + ImGui Window", 0xFFFFFF00)
+    chatmanager.add_line("Chatter v2.0 Initialized.", 0xFF00FF00)
+    chatmanager.add_line("Engine: Ashita Fonts + ImGui Window", 0xFFFFFF00)
     
     -- Add test lines to demonstrate scrolling
     for i = 1, 100 do
-        chat_manager.add_line("History Line #" .. i .. ": This is a test of the new lag-free rendering engine.", 0xFFDDDDDD)
+        chatmanager.add_line("History Line #" .. i .. ": This is a test of the new lag-free rendering engine.", 0xFFDDDDDD)
     end
-    chat_manager.add_line("Scroll up to see history!", 0xFF00FFFF)
+    chatmanager.add_line("Scroll up to see history!", 0xFF00FFFF)
 end)
 
 -- ImGui Rendering
@@ -421,7 +421,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                         if index >= 1 and index <= page_size then
                             local line_index, seg_start, seg_end = renderer.get_view_line(index)
                             if line_index then
-                                local line = chat_manager.lines[line_index]
+                                local line = chatmanager.lines[line_index]
                                 local full_text = line and line.text or ""
                                 local segment_text = ""
                                 if full_text ~= "" and seg_start <= #full_text then
@@ -460,7 +460,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                     local current_pos = nil
 
                     if line_index then
-                        local line = chat_manager.lines[line_index]
+                        local line = chatmanager.lines[line_index]
                         local full_text = line and line.text or ""
                         local segment_text = ""
                         if full_text ~= "" and seg_start <= #full_text then
@@ -515,7 +515,7 @@ ashita.events.register('text_in', 'chatter_text_in', function(e)
     end
     local mode = e.mode_modified or e.mode or 0
     local color = get_message_color(mode)
-    chat_manager.add_line(text, color)
+    chatmanager.add_line(text, color)
 end)
 
 -- Mouse Input (Selection handling moved to ImGui window)
@@ -584,7 +584,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 local lines = {}
                 -- If single line selection
                 if start_sel.line == end_sel.line then
-                    local line = chat_manager.lines[start_sel.line]
+                    local line = chatmanager.lines[start_sel.line]
                     if line and line.text then
                         local s = math.max(1, start_sel.char)
                         local e = math.min(#line.text, end_sel.char)
@@ -596,7 +596,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 else
                     -- Multi-line
                     for i = start_sel.line, end_sel.line do
-                        local line = chat_manager.lines[i]
+                        local line = chatmanager.lines[i]
                         if line and line.text then
                             if i == start_sel.line then
                                 local s = math.max(1, start_sel.char)
@@ -793,7 +793,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 end
 
                 local history_buf = { config.layout_history_lines or 50 }
-                if imgui.SliderInt("Wrap History Lines", history_buf, 10, chat_manager.max_lines or 5000) then
+                if imgui.SliderInt("Wrap History Lines", history_buf, 10, chatmanager.max_lines or 5000) then
                     config.layout_history_lines = history_buf[1]
                     renderer.set_layout_history_lines(config.layout_history_lines)
                     settings.save()

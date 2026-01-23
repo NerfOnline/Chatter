@@ -127,7 +127,7 @@ local function log_debug(msg)
 end
 
 -- Test log on load
-log_debug("Chatter text_processing loaded")
+log_debug("Chatter textprocessing loaded")
 
 local function normalize(text)
     -- Remove specific artifact first: 0x7F followed by digit
