@@ -1,0 +1,3 @@
+[submodule "submodules/gdifonts"]
+	path = submodules/gdifonts
+	url = https://github.com/ThornyFFXI/gdifonts
