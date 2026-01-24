@@ -34,7 +34,6 @@ local CF_TEXT = 1
 local GHND = 0x0042
 local GMEM_FIXED = 0x0000
 
-local want_close_menu = false
 
 local function copy_to_clipboard(text)
     print("[Chatter] Copying to clipboard...")
@@ -69,6 +68,7 @@ end
 
 local config = settings.load(T{
     theme = 'Plain',
+    context_menu_theme = 'Plain',
     font_family = 'Arial',
     font_size = 14,
     font_bold = true,
@@ -256,16 +256,13 @@ local possible_selection_start = nil
 local drag_threshold = 5
 local anchor_start_abs = nil
 local anchor_end_abs = nil
-local want_copy_menu = false
-local copy_menu_mouse_x = 0
-local copy_menu_mouse_y = 0
 local imgui_wants_mouse = false
-local copy_menu_open = false
 
 -- Initialize
 ashita.events.register('load', 'chatter_load', function()
     renderer.initialize(addon.path)
     renderer.set_theme(config.theme)
+    renderer.set_context_menu_theme(config.context_menu_theme)
     renderer.update_style(
         config.font_family,
         config.font_size,
@@ -504,9 +501,86 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
             end
 
             if imgui.IsMouseClicked(1) and selection_start_abs then
-                 want_copy_menu = true
-                 copy_menu_mouse_x = mouse_x
-                 copy_menu_mouse_y = mouse_y
+                renderer.show_context_menu(mouse_x, mouse_y)
+            end
+            if renderer.is_context_menu_visible() and imgui.IsMouseClicked(0) then
+                local item_index = renderer.get_context_menu_item_index(mouse_x, mouse_y)
+                if item_index == 1 then
+                    local start_sel = selection_start_abs
+                    local end_sel = selection_end_abs
+                    if start_sel and end_sel then
+                        if start_sel.line > end_sel.line or (start_sel.line == end_sel.line and start_sel.char > end_sel.char) then
+                            start_sel, end_sel = end_sel, start_sel
+                        end
+
+                        local function extend_end_to_word(text, s, e)
+                            if s > e or e >= #text then
+                                return s, e
+                            end
+                            local next_char = text:sub(e + 1, e + 1)
+                            if not next_char:match('%w') then
+                                return s, e
+                            end
+                            local j = e + 1
+                            while j <= #text do
+                                local c = text:sub(j, j)
+                                if not c:match('%w') then
+                                    break
+                                end
+                                j = j + 1
+                            end
+                            return s, j - 1
+                        end
+
+                        local lines = {}
+                        if start_sel.line == end_sel.line then
+                            local text = chatmanager.get_line_text(start_sel.line)
+                            if text then
+                                local s = math.max(1, start_sel.char)
+                                local e = math.min(#text, end_sel.char)
+                                s, e = extend_end_to_word(text, s, e)
+                                if s <= e then
+                                    table.insert(lines, string.sub(text, s, e))
+                                end
+                            end
+                        else
+                            for i = start_sel.line, end_sel.line do
+                                local text = chatmanager.get_line_text(i)
+                                if text then
+                                    if i == start_sel.line then
+                                        local s = math.max(1, start_sel.char)
+                                        local e = #text
+                                        s, e = extend_end_to_word(text, s, e)
+                                        table.insert(lines, string.sub(text, s, e))
+                                    elseif i == end_sel.line then
+                                        local e = math.min(#text, end_sel.char)
+                                        local s = 1
+                                        s, e = extend_end_to_word(text, s, e)
+                                        table.insert(lines, string.sub(text, 1, e))
+                                    else
+                                        table.insert(lines, text)
+                                    end
+                                end
+                            end
+                        end
+
+                        if #lines > 0 then
+                            local text = table.concat(lines, "\n")
+                            copy_to_clipboard(text)
+                        end
+                    end
+                    renderer.hide_context_menu()
+                elseif item_index == 2 then
+                    selecting = false
+                    selection_start_abs = nil
+                    selection_end_abs = nil
+                    renderer.set_selection(nil, nil)
+                    renderer.hide_context_menu()
+                elseif item_index == nil then
+                    renderer.hide_context_menu()
+                end
+            elseif renderer.is_context_menu_visible() and imgui.IsMouseClicked(1) then
+                renderer.hide_context_menu()
             end
         end
     end
@@ -545,108 +619,6 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
     local io = imgui.GetIO()
     imgui_wants_mouse = io.WantCaptureMouse
     
-    if want_copy_menu then
-        imgui.SetNextWindowPos({ copy_menu_mouse_x, copy_menu_mouse_y })
-        imgui.OpenPopup("ChatterCopyMenu")
-        want_copy_menu = false
-    end
-
-    if imgui.BeginPopup("ChatterCopyMenu") then
-        copy_menu_open = true
-        
-        if want_close_menu then
-            imgui.CloseCurrentPopup()
-            copy_menu_open = false
-            want_close_menu = false
-            imgui.EndPopup()
-            return
-        end
-
-        if imgui.MenuItem("Copy Selected Text") then
-            print("[Chatter] Copy Selected Text clicked")
-            local start_sel = selection_start_abs
-            local end_sel = selection_end_abs
-            
-            if start_sel and end_sel then
-                -- Normalize order
-                if start_sel.line > end_sel.line or (start_sel.line == end_sel.line and start_sel.char > end_sel.char) then
-                    start_sel, end_sel = end_sel, start_sel
-                end
-                
-                local function extend_end_to_word(text, s, e)
-                    if s > e or e >= #text then
-                        return s, e
-                    end
-                    local next_char = text:sub(e + 1, e + 1)
-                    if not next_char:match('%w') then
-                        return s, e
-                    end
-                    local j = e + 1
-                    while j <= #text do
-                        local c = text:sub(j, j)
-                        if not c:match('%w') then
-                            break
-                        end
-                        j = j + 1
-                    end
-                    return s, j - 1
-                end
-                
-                local lines = {}
-                -- If single line selection
-                if start_sel.line == end_sel.line then
-                    local text = chatmanager.get_line_text(start_sel.line)
-                    if text then
-                        local s = math.max(1, start_sel.char)
-                        local e = math.min(#text, end_sel.char)
-                        s, e = extend_end_to_word(text, s, e)
-                        if s <= e then
-                            table.insert(lines, string.sub(text, s, e))
-                        end
-                    end
-                else
-                    -- Multi-line
-                    for i = start_sel.line, end_sel.line do
-                        local text = chatmanager.get_line_text(i)
-                        if text then
-                            if i == start_sel.line then
-                                local s = math.max(1, start_sel.char)
-                                local e = #text
-                                s, e = extend_end_to_word(text, s, e)
-                                table.insert(lines, string.sub(text, s, e))
-                            elseif i == end_sel.line then
-                                local e = math.min(#text, end_sel.char)
-                                local s = 1
-                                s, e = extend_end_to_word(text, s, e)
-                                table.insert(lines, string.sub(text, 1, e))
-                            else
-                                table.insert(lines, text)
-                            end
-                        end
-                    end
-                end
-                
-                if #lines > 0 then
-                    local text = table.concat(lines, "\n")
-                    copy_to_clipboard(text)
-                end
-            end
-            imgui.CloseCurrentPopup()
-        end
-        if imgui.MenuItem("Clear Selection") then
-            print("[Chatter] Clear Selection clicked")
-            selecting = false
-            selection_start_abs = nil
-            selection_end_abs = nil
-            renderer.set_selection(nil, nil)
-            imgui.CloseCurrentPopup()
-        end
-        imgui.EndPopup()
-    else
-        copy_menu_open = false
-        want_close_menu = false
-    end
-
     if not show_config then return end
     
     local font_options = {
@@ -782,6 +754,25 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         if imgui.Selectable(name, selected) then
                             config.theme = name
                             renderer.set_theme(name)
+                            request_save()
+                        end
+                        if selected then
+                            imgui.SetItemDefaultFocus()
+                        end
+                    end
+                    imgui.EndCombo()
+                end
+
+                imgui.Spacing()
+                imgui.Text("Context Menu")
+
+                local current_menu_theme = config.context_menu_theme or 'Plain'
+                if imgui.BeginCombo("Context Menu Background", current_menu_theme) then
+                    for _, name in ipairs(theme_items) do
+                        local selected = (current_menu_theme == name)
+                        if imgui.Selectable(name, selected) then
+                            config.context_menu_theme = name
+                            renderer.set_context_menu_theme(name)
                             request_save()
                         end
                         if selected then
