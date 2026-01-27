@@ -17,6 +17,17 @@ local function request_save()
     save_pending = true
     last_save_request = os.clock()
 end
+local function get_effective_padding(value)
+    if value == nil then
+        value = 5
+    end
+    if value < 0 then
+        value = 0
+    elseif value > 30 then
+        value = 30
+    end
+    return value + 5
+end
 
 -- Windows Clipboard APIs
 ffi.cdef[[
@@ -33,6 +44,26 @@ ffi.cdef[[
 local CF_TEXT = 1
 local GHND = 0x0042
 local GMEM_FIXED = 0x0000
+
+local config = nil
+
+local resize_icon_path = nil
+local resize_icon = nil
+local resize_icon_tex_id = 0
+
+local function update_resize_icon_cache()
+    if not resize_icon_path then
+        return
+    end
+    if not resize_icon then
+        resize_icon = renderer.get_texture(resize_icon_path)
+        if resize_icon and resize_icon.texture then
+            resize_icon_tex_id = resize_icon.tex_id or 0
+        else
+            resize_icon_tex_id = 0
+        end
+    end
+end
 
 
 local function copy_to_clipboard(text)
@@ -66,9 +97,11 @@ local function copy_to_clipboard(text)
     end
 end
 
-local config = settings.load(T{
+config = settings.load(T{
     theme = 'Plain',
-    context_menu_theme = 'Plain',
+    background_asset = 'Progressive-Blue',
+    border_asset = 'Silent-Reach',
+    context_menu_theme = 'Progressive-Blue',
     font_family = 'Arial',
     font_size = 14,
     font_bold = true,
@@ -79,8 +112,12 @@ local config = settings.load(T{
     window_w = 600,
     window_h = 400,
     lock_window = false,
-    padding_x = 0,
-    padding_y = 0,
+    padding_x = 5,
+    padding_y = 5,
+    background_scale = 1.0,
+    border_scale = 1.0,
+    background_opacity = 1.0,
+    border_opacity = 1.0,
     background_color = {1.0, 1.0, 1.0, 1.0},
     border_color = {1.0, 1.0, 1.0, 1.0},
     outline_color = {0.0, 0.0, 0.0, 1.0},
@@ -122,8 +159,43 @@ local config = settings.load(T{
     },
 })
 
+if config.background_asset == nil or config.background_asset == '' then
+    config.background_asset = 'Progressive-Blue'
+end
+if config.border_asset == nil or config.border_asset == '' then
+    config.border_asset = 'Whispered-Veil'
+end
+if config.context_menu_theme == nil or config.context_menu_theme == '' then
+    config.context_menu_theme = config.background_asset
+end
+
 if config.outline_color == nil then
     config.outline_color = {0.0, 0.0, 0.0, 1.0}
+end
+if config.font_style == nil or config.font_style == '' then
+    if config.font_bold and config.font_italic then
+        config.font_style = 'Bold Italic'
+    elseif config.font_italic then
+        config.font_style = 'Italic'
+    else
+        config.font_style = 'Bold'
+        config.font_bold = true
+        config.font_italic = false
+    end
+end
+if config.font_style == 'Bold Italic' then
+    config.font_bold = true
+    config.font_italic = true
+elseif config.font_style == 'Italic' then
+    config.font_bold = false
+    config.font_italic = true
+elseif config.font_style == 'Bold' then
+    config.font_bold = true
+    config.font_italic = false
+else
+    config.font_style = 'Bold'
+    config.font_bold = true
+    config.font_italic = false
 end
 
 if config.colors and config.colors.self and config.colors.others and config.colors.self == config.colors.others then
@@ -229,7 +301,8 @@ local function edit_color(label, tbl, key)
     end
     local col = tbl[key] or {1.0, 1.0, 1.0, 1.0}
     local value = {col[1], col[2], col[3], col[4]}
-    if imgui.ColorEdit4(label, value) then
+    local flags = bit.bor(ImGuiColorEditFlags_NoInputs, ImGuiColorEditFlags_AlphaBar)
+    if imgui.ColorEdit4(label, value, flags) then
         tbl[key] = value
         request_save()
     end
@@ -245,6 +318,7 @@ local resize_start_mouse_x = 0
 local resize_start_mouse_y = 0
 local resize_start_w = 0
 local resize_start_h = 0
+local resize_start_y = 0
 local RESIZE_HANDLE_SIZE = 32
 local MIN_WINDOW_W = 200
 local MIN_WINDOW_H = 100
@@ -260,9 +334,10 @@ local imgui_wants_mouse = false
 
 -- Initialize
 ashita.events.register('load', 'chatter_load', function()
+    show_config = false
     renderer.initialize(addon.path)
-    renderer.set_theme(config.theme)
-    renderer.set_context_menu_theme(config.context_menu_theme)
+    renderer.set_background_asset(config.background_asset or 'Plain')
+    renderer.set_border_asset(config.border_asset)
     renderer.update_style(
         config.font_family,
         config.font_size,
@@ -275,6 +350,14 @@ ashita.events.register('load', 'chatter_load', function()
     local bd_col = config.border_color or {1.0, 1.0, 1.0, 1.0}
     renderer.set_background_color(color_to_argb(bg_col))
     renderer.set_border_color(color_to_argb(bd_col))
+    renderer.set_background_scale(config.background_scale or 1.0)
+    renderer.set_border_scale(config.border_scale or 1.0)
+    renderer.set_background_opacity(config.background_opacity or 1.0)
+    renderer.set_border_opacity(config.border_opacity or 1.0)
+    renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
+
+    resize_icon_path = addon.path .. 'assets\\backgrounds\\resize.png'
+    update_resize_icon_cache()
     
     -- Load History
     chatmanager.load_history(addon.path .. 'chathistory.lua')
@@ -296,6 +379,9 @@ end)
 
 -- ImGui Rendering
 ashita.events.register('d3d_present', 'chatter_render_ui', function()
+    if not renderer.is_assets_loaded() then
+        return
+    end
     -- Render the ImGui dummy window (invisible container for layout/geometry)
     imgui.SetNextWindowSize({ config.window_w, config.window_h }, ImGuiCond_Always)
     imgui.SetNextWindowPos({ config.window_x, config.window_y }, ImGuiCond_Always)
@@ -322,16 +408,17 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
         local pos_x, pos_y = imgui.GetCursorScreenPos()
         local avail_w, avail_h = imgui.GetContentRegionAvail()
 
-        local pad_x = config.padding_x or 0
-        local pad_y = config.padding_y or 0
-        if pad_x < 0 then pad_x = 0 end
-        if pad_y < 0 then pad_y = 0 end
+        local pad_x = get_effective_padding(config.padding_x)
+        local pad_y = get_effective_padding(config.padding_y)
+        local render_x = pos_x
+        local render_y = pos_y
+        local render_w = math.max(0, avail_w)
+        local render_h = math.max(0, avail_h)
         local content_x = pos_x + pad_x
         local content_y = pos_y + pad_y
-        local content_w = math.max(0, avail_w - pad_x * 2)
-        local content_h = math.max(0, avail_h - pad_y * 2)
         
-        renderer.update_geometry(content_x, content_y, content_w, content_h)
+        renderer.update_geometry(render_x, render_y, render_w, render_h)
+        renderer.mark_geometry_ready()
         
         local win_x, win_y = imgui.GetWindowPos()
         local win_w, win_h = imgui.GetWindowSize()
@@ -344,18 +431,37 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
         config.window_w = win_w
         config.window_h = win_h
 
-        local draw_list = imgui.GetWindowDrawList()
+        local draw_list = imgui.GetForegroundDrawList()
         if not config.lock_window then
-            local grip_color = imgui.GetColorU32({1.0, 1.0, 1.0, 0.9})
-            local size = 20
-            local step = math.floor(size / 3)
-            local gx2 = win_x + win_w - 4 + 3
-            local gy2 = win_y + win_h - 4 - 1
-            local gx1 = gx2 - size
-            local gy1 = gy2 - size
-            draw_list:AddLine({gx1, gy2}, {gx2, gy1}, grip_color, 1.8)
-            draw_list:AddLine({gx1 + step, gy2}, {gx2, gy1 + step}, grip_color, 1.8)
-            draw_list:AddLine({gx1 + step * 2, gy2}, {gx2, gy1 + step * 2}, grip_color, 1.8)
+            if not resize_icon then
+                update_resize_icon_cache()
+            end
+            if resize_icon and resize_icon.texture and resize_icon_tex_id ~= 0 then
+                local tint_u32 = 0xFFFFFFFF
+                local size = 18
+                local margin = -2
+                local gx2 = win_x + win_w - margin
+                local gy1 = win_y + margin
+                local max_x = win_x + win_w
+                local max_y = win_y + win_h
+                local min_x = win_x
+                local min_y = win_y
+                if gx2 > max_x then gx2 = max_x end
+                local gx1 = gx2 - size
+                local gy2 = gy1 + size
+                if gx1 < min_x then
+                    gx1 = min_x
+                    gx2 = gx1 + size
+                end
+                if gy1 < min_y then
+                    gy1 = min_y
+                    gy2 = gy1 + size
+                elseif gy2 > max_y then
+                    gy2 = max_y
+                    gy1 = gy2 - size
+                end
+                draw_list:AddImage(resize_icon_tex_id, {gx1, gy1}, {gx2, gy2}, {0, 0}, {1, 1}, tint_u32)
+            end
         end
         
         if imgui.IsWindowHovered() or is_resizing or is_dragging or selecting then
@@ -365,12 +471,13 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
             end
 
             local mouse_x, mouse_y = imgui.GetMousePos()
-            local rel_x = mouse_x - content_x
-            local rel_y = mouse_y - content_y
+            local rel_x = mouse_x - content_x - get_effective_padding(config.padding_x)
+            local rel_y = mouse_y - content_y - get_effective_padding(config.padding_y)
 
-            local resize_zone_x1 = win_x + win_w - RESIZE_HANDLE_SIZE
-            local resize_zone_y1 = win_y + win_h - RESIZE_HANDLE_SIZE
-            local in_resize_zone = (not config.lock_window) and (mouse_x >= resize_zone_x1) and (mouse_y >= resize_zone_y1)
+            local resize_zone_x1 = win_x + win_w - RESIZE_HANDLE_SIZE + 5
+            local resize_zone_y1 = win_y
+            local resize_zone_y2 = win_y + RESIZE_HANDLE_SIZE - 5
+            local in_resize_zone = (not config.lock_window) and (mouse_x >= resize_zone_x1) and (mouse_y >= resize_zone_y1) and (mouse_y <= resize_zone_y2)
 
             if imgui.IsMouseClicked(0) and in_resize_zone then
                 is_resizing = true
@@ -379,6 +486,7 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                 resize_start_mouse_y = mouse_y
                 resize_start_w = config.window_w
                 resize_start_h = config.window_h
+                resize_start_y = config.window_y
                 possible_selection_start = nil
                 selecting = false
             end
@@ -387,11 +495,14 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                 local dx = mouse_x - resize_start_mouse_x
                 local dy = mouse_y - resize_start_mouse_y
                 local new_w = resize_start_w + dx
-                local new_h = resize_start_h + dy
                 if new_w < MIN_WINDOW_W then new_w = MIN_WINDOW_W end
+                local bottom_y = resize_start_y + resize_start_h
+                local new_h = resize_start_h - dy
                 if new_h < MIN_WINDOW_H then new_h = MIN_WINDOW_H end
+                local new_y = bottom_y - new_h
                 config.window_w = new_w
                 config.window_h = new_h
+                config.window_y = new_y
             elseif is_resizing and not imgui.IsMouseDown(0) then
                 is_resizing = false
                 renderer.set_resizing(false)
@@ -500,86 +611,10 @@ ashita.events.register('d3d_present', 'chatter_render_ui', function()
                 end
             end
 
-            if imgui.IsMouseClicked(1) and selection_start_abs then
+            if imgui.IsMouseClicked(1) then
                 renderer.show_context_menu(mouse_x, mouse_y)
             end
             if renderer.is_context_menu_visible() and imgui.IsMouseClicked(0) then
-                local item_index = renderer.get_context_menu_item_index(mouse_x, mouse_y)
-                if item_index == 1 then
-                    local start_sel = selection_start_abs
-                    local end_sel = selection_end_abs
-                    if start_sel and end_sel then
-                        if start_sel.line > end_sel.line or (start_sel.line == end_sel.line and start_sel.char > end_sel.char) then
-                            start_sel, end_sel = end_sel, start_sel
-                        end
-
-                        local function extend_end_to_word(text, s, e)
-                            if s > e or e >= #text then
-                                return s, e
-                            end
-                            local next_char = text:sub(e + 1, e + 1)
-                            if not next_char:match('%w') then
-                                return s, e
-                            end
-                            local j = e + 1
-                            while j <= #text do
-                                local c = text:sub(j, j)
-                                if not c:match('%w') then
-                                    break
-                                end
-                                j = j + 1
-                            end
-                            return s, j - 1
-                        end
-
-                        local lines = {}
-                        if start_sel.line == end_sel.line then
-                            local text = chatmanager.get_line_text(start_sel.line)
-                            if text then
-                                local s = math.max(1, start_sel.char)
-                                local e = math.min(#text, end_sel.char)
-                                s, e = extend_end_to_word(text, s, e)
-                                if s <= e then
-                                    table.insert(lines, string.sub(text, s, e))
-                                end
-                            end
-                        else
-                            for i = start_sel.line, end_sel.line do
-                                local text = chatmanager.get_line_text(i)
-                                if text then
-                                    if i == start_sel.line then
-                                        local s = math.max(1, start_sel.char)
-                                        local e = #text
-                                        s, e = extend_end_to_word(text, s, e)
-                                        table.insert(lines, string.sub(text, s, e))
-                                    elseif i == end_sel.line then
-                                        local e = math.min(#text, end_sel.char)
-                                        local s = 1
-                                        s, e = extend_end_to_word(text, s, e)
-                                        table.insert(lines, string.sub(text, 1, e))
-                                    else
-                                        table.insert(lines, text)
-                                    end
-                                end
-                            end
-                        end
-
-                        if #lines > 0 then
-                            local text = table.concat(lines, "\n")
-                            copy_to_clipboard(text)
-                        end
-                    end
-                    renderer.hide_context_menu()
-                elseif item_index == 2 then
-                    selecting = false
-                    selection_start_abs = nil
-                    selection_end_abs = nil
-                    renderer.set_selection(nil, nil)
-                    renderer.hide_context_menu()
-                elseif item_index == nil then
-                    renderer.hide_context_menu()
-                end
-            elseif renderer.is_context_menu_visible() and imgui.IsMouseClicked(1) then
                 renderer.hide_context_menu()
             end
         end
@@ -659,52 +694,64 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
     local buttonHoverColor = bgLight
     local buttonActiveColor = bgLighter
 
-    imgui.PushStyleColor(ImGuiCol_WindowBg, bgColor)
-    imgui.PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0})
-    imgui.PushStyleColor(ImGuiCol_TitleBg, bgMedium)
-    imgui.PushStyleColor(ImGuiCol_TitleBgActive, bgLight)
-    imgui.PushStyleColor(ImGuiCol_TitleBgCollapsed, bgDark)
-    imgui.PushStyleColor(ImGuiCol_FrameBg, bgMedium)
-    imgui.PushStyleColor(ImGuiCol_FrameBgHovered, bgLight)
-    imgui.PushStyleColor(ImGuiCol_FrameBgActive, bgLighter)
-    imgui.PushStyleColor(ImGuiCol_Header, bgLight)
-    imgui.PushStyleColor(ImGuiCol_HeaderHovered, bgLighter)
-    imgui.PushStyleColor(ImGuiCol_HeaderActive, {accent[1], accent[2], accent[3], 0.35})
-    imgui.PushStyleColor(ImGuiCol_Border, borderDark)
-    imgui.PushStyleColor(ImGuiCol_Text, textLight)
-    imgui.PushStyleColor(ImGuiCol_TextDisabled, {0.55, 0.62, 0.78, 1.0})
-    imgui.PushStyleColor(ImGuiCol_Button, buttonColor)
-    imgui.PushStyleColor(ImGuiCol_ButtonHovered, buttonHoverColor)
-    imgui.PushStyleColor(ImGuiCol_ButtonActive, buttonActiveColor)
-    imgui.PushStyleColor(ImGuiCol_CheckMark, accent)
-    imgui.PushStyleColor(ImGuiCol_SliderGrab, accentDark)
-    imgui.PushStyleColor(ImGuiCol_SliderGrabActive, accent)
-    imgui.PushStyleColor(ImGuiCol_Tab, bgMedium)
-    imgui.PushStyleColor(ImGuiCol_TabHovered, bgLight)
-    imgui.PushStyleColor(ImGuiCol_TabActive, {accent[1], accent[2], accent[3], 0.35})
-    imgui.PushStyleColor(ImGuiCol_TabUnfocused, bgDark)
-    imgui.PushStyleColor(ImGuiCol_TabUnfocusedActive, bgMedium)
-    imgui.PushStyleColor(ImGuiCol_ScrollbarBg, bgMedium)
-    imgui.PushStyleColor(ImGuiCol_ScrollbarGrab, accentDarker)
-    imgui.PushStyleColor(ImGuiCol_ScrollbarGrabHovered, accentDark)
-    imgui.PushStyleColor(ImGuiCol_ScrollbarGrabActive, accent)
+    if show_config then
+        imgui.PushStyleColor(ImGuiCol_WindowBg, bgColor)
+        imgui.PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0})
+        imgui.PushStyleColor(ImGuiCol_TitleBg, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_TitleBgActive, bgLight)
+        imgui.PushStyleColor(ImGuiCol_TitleBgCollapsed, bgDark)
+        imgui.PushStyleColor(ImGuiCol_FrameBg, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_FrameBgHovered, bgLight)
+        imgui.PushStyleColor(ImGuiCol_FrameBgActive, bgLighter)
+        imgui.PushStyleColor(ImGuiCol_Header, bgLight)
+        imgui.PushStyleColor(ImGuiCol_HeaderHovered, bgLighter)
+        imgui.PushStyleColor(ImGuiCol_HeaderActive, {accent[1], accent[2], accent[3], 0.35})
+        imgui.PushStyleColor(ImGuiCol_Border, borderDark)
+        imgui.PushStyleColor(ImGuiCol_Text, textLight)
+        imgui.PushStyleColor(ImGuiCol_TextDisabled, {0.55, 0.62, 0.78, 1.0})
+        imgui.PushStyleColor(ImGuiCol_Button, buttonColor)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, buttonHoverColor)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive, buttonActiveColor)
+        imgui.PushStyleColor(ImGuiCol_CheckMark, accent)
+        imgui.PushStyleColor(ImGuiCol_SliderGrab, accentDark)
+        imgui.PushStyleColor(ImGuiCol_SliderGrabActive, accent)
+        imgui.PushStyleColor(ImGuiCol_Tab, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_TabHovered, bgLight)
+        imgui.PushStyleColor(ImGuiCol_TabActive, {accent[1], accent[2], accent[3], 0.35})
+        imgui.PushStyleColor(ImGuiCol_TabUnfocused, bgDark)
+        imgui.PushStyleColor(ImGuiCol_TabUnfocusedActive, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarBg, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarGrab, accentDarker)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarGrabHovered, accentDark)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarGrabActive, accent)
+        imgui.PushStyleColor(ImGuiCol_ResizeGrip, {accent[1], accent[2], accent[3], 0.35})
+        imgui.PushStyleColor(ImGuiCol_ResizeGripHovered, accentLight)
+        imgui.PushStyleColor(ImGuiCol_ResizeGripActive, accent)
 
-    imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {12, 12})
-    imgui.PushStyleVar(ImGuiStyleVar_FramePadding, {6, 4})
-    imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, 6})
-    imgui.PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0)
-    imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0)
-    imgui.PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0)
-    imgui.PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 4.0)
-    imgui.PushStyleVar(ImGuiStyleVar_GrabRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {12, 12})
+        imgui.PushStyleVar(ImGuiStyleVar_FramePadding, {6, 4})
+        imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, 6})
+        imgui.PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0)
+        imgui.PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_GrabRounding, 4.0)
 
-    imgui.SetNextWindowSize({ 900, 650 }, ImGuiCond_FirstUseEver)
-    imgui.Begin("Chatter Config", show_config, 0)
+        imgui.SetNextWindowSize({ 900, 650 }, ImGuiCond_FirstUseEver)
+        local config_open = { show_config }
+        local config_visible = imgui.Begin("Chatter Config", config_open, 0)
+        show_config = config_open[1]
+        if not config_visible then
+            imgui.End()
+            imgui.PopStyleVar(8)
+            imgui.PopStyleColor(31)
+            return
+        end
 
-    local sidebarWidth = 200
+        local sidebarWidth = 180
 
-    imgui.BeginChild("ChatterConfigLeft", {sidebarWidth, 0}, true)
-    imgui.PushStyleVar(ImGuiStyleVar_FramePadding, {10, 8})
+        imgui.BeginChild("ChatterConfigLeft", {sidebarWidth, 0}, true)
+        imgui.PushStyleVar(ImGuiStyleVar_FramePadding, {8, 6})
 
     local general_selected = (current_config_section == 'General')
     if general_selected then
@@ -716,7 +763,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
         imgui.PushStyleColor(ImGuiCol_ButtonHovered, {accent[1], accent[2], accent[3], 0.25})
         imgui.PushStyleColor(ImGuiCol_ButtonActive, {accent[1], accent[2], accent[3], 0.35})
     end
-    if imgui.Button("General", {sidebarWidth - 16, 32}) then
+    if imgui.Button("General", {sidebarWidth - 24, 24}) then
         current_config_section = 'General'
     end
     imgui.PopStyleColor(3)
@@ -731,7 +778,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
         imgui.PushStyleColor(ImGuiCol_ButtonHovered, {accent[1], accent[2], accent[3], 0.25})
         imgui.PushStyleColor(ImGuiCol_ButtonActive, {accent[1], accent[2], accent[3], 0.35})
     end
-    if imgui.Button("Fonts", {sidebarWidth - 16, 32}) then
+    if imgui.Button("Fonts", {sidebarWidth - 24, 24}) then
         current_config_section = 'Fonts'
     end
     imgui.PopStyleColor(3)
@@ -743,17 +790,89 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
 
     imgui.BeginChild("ChatterConfigRight", {0, 0}, false)
 
-    if current_config_section == 'General' then
+    if config_visible and current_config_section == 'General' then
         if imgui.BeginTabBar("ChatterGeneralTabs") then
             if imgui.BeginTabItem("General") then
-                local theme_items = {'Plain', 'Window1', 'Window2', 'Window3', 'Window4', 'Window5', 'Window6', 'Window7', 'Window8', '-None-'}
-                local current_theme = config.theme or 'Plain'
-                if imgui.BeginCombo("Background", current_theme) then
-                    for _, name in ipairs(theme_items) do
-                        local selected = (current_theme == name)
-                        if imgui.Selectable(name, selected) then
-                            config.theme = name
-                            renderer.set_theme(name)
+                local function scan_assets()
+                    local root = addon.path .. 'assets\\backgrounds\\'
+                    local function file_exists(path)
+                        if ashita and ashita.fs and ashita.fs.exists then
+                            return ashita.fs.exists(path)
+                        end
+                        local f = io.open(path, 'rb')
+                        if f then
+                            f:close()
+                            return true
+                        end
+                        return false
+                    end
+                    local background_order = {
+                        'Progressive Blue',
+                        'Concrete',
+                        'Interlaced Blue',
+                        'Dark Matter',
+                        'White Canvas',
+                        'Abyss Blue',
+                        'Warm Sand',
+                        'Deep Ocean',
+                        'Simple Geometry',
+                    }
+                    local border_order = {
+                        'Silent Reach',
+                        'Whispered Veil',
+                        'Ethereal Frame',
+                        'Celestial Mantle',
+                        'Radiant Enclosure',
+                        'Ventilated Steel',
+                        'Ironclad Steel',
+                        'Inset Gold',
+                        'Solid Gold',
+                        'Sandstorm',
+                        'Sandpaper',
+                        'Sea Lantern',
+                        'Prismarine',
+                    }
+                    local backgrounds = {}
+                    local borders = {}
+                    for _, name in ipairs(background_order) do
+                        local base = name:gsub('%s+', '-')
+                        if file_exists(root .. base .. '-bg.png') then
+                            table.insert(backgrounds, { base = base, display = name })
+                        end
+                    end
+                    for _, name in ipairs(border_order) do
+                        local base = name:gsub('%s+', '-')
+                        if file_exists(root .. base .. '-corners.png') and file_exists(root .. base .. '-sides.png') then
+                            table.insert(borders, { base = base, display = name })
+                        end
+                    end
+                    for i, item in ipairs(backgrounds) do
+                        item.display_num = string.format('%d - %s', i, item.display)
+                    end
+                    for i, item in ipairs(borders) do
+                        item.display_num = string.format('%d - %s', i, item.display)
+                    end
+                    return backgrounds, borders
+                end
+                local function display_for(list, base)
+                    if not base then
+                        return ''
+                    end
+                    for _, it in ipairs(list) do
+                        if it.base == base then
+                            return it.display_num or it.display
+                        end
+                    end
+                    return base:gsub('%-', ' ')
+                end
+                local bg_items, border_items = scan_assets()
+                local current_bg = config.background_asset or 'Plain'
+                if imgui.BeginCombo("Background Image", display_for(bg_items, current_bg)) then
+                    for _, it in ipairs(bg_items) do
+                        local selected = (current_bg == it.base)
+                        if imgui.Selectable(it.display_num or it.display, selected) then
+                            config.background_asset = it.base
+                            renderer.set_background_asset(it.base)
                             request_save()
                         end
                         if selected then
@@ -761,18 +880,78 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         end
                     end
                     imgui.EndCombo()
+                end
+                local current_border = config.border_asset or 'Whispered-Veil'
+                if imgui.BeginCombo("Border Style", display_for(border_items, current_border)) then
+                    for _, it in ipairs(border_items) do
+                        local selected = (current_border == it.base)
+                        if imgui.Selectable(it.display_num or it.display, selected) then
+                            config.border_asset = it.base
+                            renderer.set_border_asset(it.base)
+                            renderer.set_context_menu_border_asset(it.base)
+                            request_save()
+                        end
+                        if selected then
+                            imgui.SetItemDefaultFocus()
+                        end
+                    end
+                    imgui.EndCombo()
+                end
+                
+                local bg_scale_buf = { config.background_scale or 1.0 }
+                if imgui.SliderFloat("Background Scale", bg_scale_buf, 0.1, 3.0, "%.2f") then
+                    config.background_scale = bg_scale_buf[1]
+                    renderer.set_background_scale(bg_scale_buf[1])
+                    request_save()
+                end
+
+                local bg_opacity_buf = { config.background_opacity or 1.0 }
+                if imgui.SliderFloat("Background Opacity", bg_opacity_buf, 0.0, 1.0, "%.2f") then
+                    config.background_opacity = bg_opacity_buf[1]
+                    renderer.set_background_opacity(bg_opacity_buf[1])
+                    local bg_col = config.background_color or {1.0, 1.0, 1.0, 1.0}
+                    bg_col[4] = bg_opacity_buf[1]
+                    config.background_color = bg_col
+                    renderer.set_background_color(color_to_argb(bg_col))
+                    request_save()
+                end
+
+                local border_opacity_buf = { config.border_opacity or 1.0 }
+                if imgui.SliderFloat("Border Opacity", border_opacity_buf, 0.0, 1.0, "%.2f") then
+                    config.border_opacity = border_opacity_buf[1]
+                    renderer.set_border_opacity(border_opacity_buf[1])
+                    local bd_col = config.border_color or {1.0, 1.0, 1.0, 1.0}
+                    bd_col[4] = border_opacity_buf[1]
+                    config.border_color = bd_col
+                    renderer.set_border_color(color_to_argb(bd_col))
+                    request_save()
+                end
+
+                local pad_x_buf = { config.padding_x or 5 }
+                if imgui.SliderInt("Window Padding X", pad_x_buf, 0, 30) then
+                    config.padding_x = pad_x_buf[1]
+                    renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
+                    request_save()
+                end
+
+                local pad_y_buf = { config.padding_y or 5 }
+                if imgui.SliderInt("Window Padding Y", pad_y_buf, 0, 30) then
+                    config.padding_y = pad_y_buf[1]
+                    renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
+                    request_save()
                 end
 
                 imgui.Spacing()
                 imgui.Text("Context Menu")
 
                 local current_menu_theme = config.context_menu_theme or 'Plain'
-                if imgui.BeginCombo("Context Menu Background", current_menu_theme) then
-                    for _, name in ipairs(theme_items) do
+                if imgui.BeginCombo("Context Menu Background", display_for(bg_items, current_menu_theme)) then
+                    for _, it in ipairs(bg_items) do
+                        local name = it.base
                         local selected = (current_menu_theme == name)
-                        if imgui.Selectable(name, selected) then
+                        if imgui.Selectable(it.display_num or it.display, selected) then
                             config.context_menu_theme = name
-                            renderer.set_context_menu_theme(name)
+                            renderer.set_context_menu_background_asset(name)
                             request_save()
                         end
                         if selected then
@@ -780,18 +959,6 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                         end
                     end
                     imgui.EndCombo()
-                end
-
-                local pad_x_buf = { config.padding_x or 0 }
-                if imgui.SliderInt("Window Padding X", pad_x_buf, 0, 64) then
-                    config.padding_x = pad_x_buf[1]
-                    request_save()
-                end
-
-                local pad_y_buf = { config.padding_y or 0 }
-                if imgui.SliderInt("Window Padding Y", pad_y_buf, 0, 64) then
-                    config.padding_y = pad_y_buf[1]
-                    request_save()
                 end
 
                 local lock_val = { config.lock_window }
@@ -804,19 +971,24 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
             end
 
             if imgui.BeginTabItem("Colors") then
+                local color_flags = bit.bor(ImGuiColorEditFlags_NoInputs, ImGuiColorEditFlags_AlphaBar)
                 local bg_col = config.background_color or {1.0, 1.0, 1.0, 1.0}
                 local bg_val = {bg_col[1], bg_col[2], bg_col[3], bg_col[4]}
-                if imgui.ColorEdit4("Background Color", bg_val) then
+                if imgui.ColorEdit4("Background Color", bg_val, color_flags) then
                     config.background_color = bg_val
                     renderer.set_background_color(color_to_argb(bg_val))
+                    config.background_opacity = bg_val[4]
+                    renderer.set_background_opacity(bg_val[4])
                     request_save()
                 end
 
                 local bd_col = config.border_color or {1.0, 1.0, 1.0, 1.0}
                 local bd_val = {bd_col[1], bd_col[2], bd_col[3], bd_col[4]}
-                if imgui.ColorEdit4("Border Color", bd_val) then
+                if imgui.ColorEdit4("Border Color", bd_val, color_flags) then
                     config.border_color = bd_val
                     renderer.set_border_color(color_to_argb(bd_val))
+                    config.border_opacity = bd_val[4]
+                    renderer.set_border_opacity(bd_val[4])
                     request_save()
                 end
 
@@ -825,7 +997,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
 
             imgui.EndTabBar()
         end
-    elseif current_config_section == 'Fonts' then
+    elseif config_visible and current_config_section == 'Fonts' then
         if imgui.BeginTabBar("ChatterFontsTabs") then
             if imgui.BeginTabItem("Fonts") then
                 local current_font = config.font_family
@@ -887,52 +1059,47 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                     request_save()
                 end
                 
-                local bold_val = { config.font_bold }
-                if imgui.Checkbox("Bold", bold_val) then
-                    config.font_bold = bold_val[1]
-                    renderer.update_style(
-                        config.font_family,
-                        config.font_size,
-                        config.font_bold,
-                        config.font_italic,
-                        config.outline_enabled,
-                        color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
-                    )
-                    request_save()
+                local style_options = { 'Bold', 'Italic', 'Bold Italic' }
+                local current_style = config.font_style or 'Bold'
+                if current_style ~= 'Bold' and current_style ~= 'Italic' and current_style ~= 'Bold Italic' then
+                    if config.font_bold and config.font_italic then
+                        current_style = 'Bold Italic'
+                    elseif config.font_italic then
+                        current_style = 'Italic'
+                    else
+                        current_style = 'Bold'
+                    end
+                    config.font_style = current_style
                 end
-                
-                local italic_val = { config.font_italic }
-                if imgui.Checkbox("Italic", italic_val) then
-                    config.font_italic = italic_val[1]
-                    renderer.update_style(
-                        config.font_family,
-                        config.font_size,
-                        config.font_bold,
-                        config.font_italic,
-                        config.outline_enabled,
-                        color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
-                    )
-                    request_save()
-                end
-                
-                local outline_val = { config.outline_enabled }
-                if imgui.Checkbox("Outline", outline_val) then
-                    config.outline_enabled = outline_val[1]
-                    renderer.update_style(
-                        config.font_family,
-                        config.font_size,
-                        config.font_bold,
-                        config.font_italic,
-                        config.outline_enabled,
-                        color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
-                    )
-                    request_save()
+                if imgui.BeginCombo("Font Style", current_style) then
+                    for _, style in ipairs(style_options) do
+                        local selected = (current_style == style)
+                        if imgui.Selectable(style, selected) then
+                            config.font_style = style
+                            config.font_bold = (style == 'Bold' or style == 'Bold Italic')
+                            config.font_italic = (style == 'Italic' or style == 'Bold Italic')
+                            renderer.update_style(
+                                config.font_family,
+                                config.font_size,
+                                config.font_bold,
+                                config.font_italic,
+                                config.outline_enabled,
+                                color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
+                            )
+                            request_save()
+                        end
+                        if selected then
+                            imgui.SetItemDefaultFocus()
+                        end
+                    end
+                    imgui.EndCombo()
                 end
 
                 imgui.EndTabItem()
             end
 
             if imgui.BeginTabItem("Colors") then
+                local color_flags = bit.bor(ImGuiColorEditFlags_NoInputs, ImGuiColorEditFlags_AlphaBar)
                 local colors = config.colors
                 if colors then
                     if imgui.CollapsingHeader("Chat") then
@@ -950,7 +1117,7 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
 
                         local outline_col = config.outline_color or {0.0, 0.0, 0.0, 1.0}
                         local outline_val = {outline_col[1], outline_col[2], outline_col[3], outline_col[4]}
-                        if imgui.ColorEdit4("Outline Color", outline_val) then
+                        if imgui.ColorEdit4("Outline Color", outline_val, color_flags) then
                             config.outline_color = outline_val
                             renderer.update_style(
                                 config.font_family,
@@ -996,12 +1163,13 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
         end
     end
 
-    imgui.EndChild()
-    
-    imgui.End()
+        imgui.EndChild()
+        
+        imgui.End()
 
-    imgui.PopStyleVar(8)
-    imgui.PopStyleColor(28)
+        imgui.PopStyleVar(8)
+        imgui.PopStyleColor(31)
+    end
 end)
 
 ashita.events.register('unload', 'chatter_unload', function()

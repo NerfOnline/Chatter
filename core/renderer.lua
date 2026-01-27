@@ -4,6 +4,7 @@ local d3d = require('d3d8')
 local ffi = require('ffi')
 local chatmanager = require('core.chatmanager')
 local gdi = require('submodules.gdifonts.include')
+local spritebackground = require('core.spritebackground')
 local bit = require('bit')
 
 -- Localize global functions for performance
@@ -17,6 +18,10 @@ local string_format = string.format
 local string_byte = string.byte
 local table_insert = table.insert
 local table_remove = table.remove
+local bit_band = bit.band
+local bit_bor = bit.bor
+local bit_lshift = bit.lshift
+local bit_rshift = bit.rshift
 
 local measurement_cache = {}
 
@@ -112,6 +117,10 @@ function CachedFont:set_outline_width(width)
     end
 end
 
+function CachedFont:set_z_order(z_order)
+    self.font:set_z_order(z_order)
+end
+
 function CachedFont:get_text_size()
     return self.font:get_text_size()
 end
@@ -156,6 +165,7 @@ local visible_slot_key = {}
 local free_list = {}
 local last_visible_count = 0
 local background_dirty = true
+local assets_loaded = false
 local layout_task = nil
 local layout_rebuild_mode = 'immediate'
 local layout_lines_per_frame = 8
@@ -173,6 +183,7 @@ local pending_style = { family = nil, size = nil, flags = nil, outline_color = n
 
 local total_visual_lines = 0
 local window_rect = { x = 100, y = 100, w = 600, h = 400 }
+local geometry_ready = false
 local scroll_offset = 0
 local is_resizing = false
 local is_layout_dirty = true
@@ -180,24 +191,27 @@ local is_render_dirty = true
 local selection_start_abs = nil
 local selection_end_abs = nil
 local measure_font = nil
+local loading_font = nil
 
 local selection_rects = {}
 local addon_path_cache = ''
 
-local bg_rect = nil
 local bg_sprite = nil
 local bg_texture = nil
-local border_textures = { tl = nil, tr = nil, bl = nil, br = nil }
-local current_theme = 'Plain'
+local spritebg = nil
+local main_bg_handle = nil
+local context_bg_handle = nil
+local current_background_asset = 'Progressive-Blue'
+local current_border_asset = 'Whispered-Veil'
 local background_color = 0xC0000000
 local border_color = 0xFFFFFFFF
+local background_scale = 1.0
+local border_scale = 1.0
+local background_opacity = 1.0
+local border_opacity = 1.0
+local background_base_w = 0
+local background_base_h = 0
 local background_draw = { x = 0, y = 0, w = 0, h = 0 }
-local border_draw = {
-    tl = { x = 0, y = 0, w = 0, h = 0, visible = false },
-    tr = { x = 0, y = 0, w = 0, h = 0, visible = false },
-    bl = { x = 0, y = 0, w = 0, h = 0, visible = false },
-    br = { x = 0, y = 0, w = 0, h = 0, visible = false },
-}
 local background_theme = nil
 local context_menu_visible = false
 local context_menu_x = 0
@@ -206,23 +220,18 @@ local context_menu_w = 0
 local context_menu_h = 0
 local context_menu_padding = 8
 local context_menu_item_spacing = 4
-local context_menu_items = { 'Copy Selected Text', 'Clear Selection' }
+local context_menu_items = { 'Copy Text', 'Send Tell', 'Configuration' }
 local context_menu_fonts = {}
 local context_menu_bg_rect = nil
 local context_menu_bg_texture = nil
-local context_menu_border_textures = { tl = nil, tr = nil, bl = nil, br = nil }
 local context_menu_background_draw = { x = 0, y = 0, w = 0, h = 0 }
-local context_menu_border_draw = {
-    tl = { x = 0, y = 0, w = 0, h = 0, visible = false },
-    tr = { x = 0, y = 0, w = 0, h = 0, visible = false },
-    bl = { x = 0, y = 0, w = 0, h = 0, visible = false },
-    br = { x = 0, y = 0, w = 0, h = 0, visible = false },
-}
-local context_menu_theme = 'Plain'
+local context_menu_background_asset = 'Progressive-Blue'
+local context_menu_border_asset = 'Whispered-Veil'
 local context_menu_theme_cache = nil
 local update_context_menu_layout
 
-local PADDING = 0
+local PADDING_X = 0
+local PADDING_Y = 0
 local LINE_SPACING = 2
 local outline_colors = {
     off = 0x00000000,
@@ -230,7 +239,7 @@ local outline_colors = {
 }
 
 local BORDER_PADDING = 8
-local BORDER_SIZE = 21
+local BORDER_SIZE = 16
 local BORDER_OFFSET = 1
 local BORDER_SCALE = 1.0
 
@@ -269,6 +278,8 @@ end)
 
 local D3DX_DEFAULT = 0xFFFFFFFF
 local D3DPOOL_MANAGED = 1
+local D3DXSPRITE_ALPHABLEND = 0x00000002
+local texture_cache = {}
 local bg_vec_position = ffi.new('D3DXVECTOR2', { 0, 0 })
 local bg_vec_scale = ffi.new('D3DXVECTOR2', { 1.0, 1.0 })
 
@@ -311,9 +322,12 @@ local function load_texture(path)
     if hr ~= 0 or tex_ptr[0] == nil then
         return nil
     end
+    local texture = d3d.gc_safe_release(ffi.cast('IDirect3DTexture8*', tex_ptr[0]))
+    local tex_id = tonumber(ffi.cast('uintptr_t', texture)) or 0
     local rect = ffi.new('RECT', { 0, 0, info[0].Width, info[0].Height })
     return {
-        texture = d3d.gc_safe_release(ffi.cast('IDirect3DTexture8*', tex_ptr[0])),
+        texture = texture,
+        tex_id = tex_id,
         width = info[0].Width,
         height = info[0].Height,
         rect = rect,
@@ -339,149 +353,102 @@ local function draw_texture(texture_info, x, y, w, h, color)
     bg_sprite:Draw(texture_info.texture, texture_info.rect, bg_vec_scale, nil, 0.0, bg_vec_position, color or 0xFFFFFFFF)
 end
 
-local function is_window_theme(name)
-    if not name then
-        return false
+function renderer.get_texture(path)
+    if not path or path == '' then
+        return nil
     end
-    return name:match('^Window%d+$') ~= nil
+    local cached = texture_cache[path]
+    if cached ~= nil then
+        if cached == false then
+            return nil
+        end
+        return cached
+    end
+    local tex = load_texture(path)
+    if tex == nil then
+        texture_cache[path] = false
+        return nil
+    end
+    texture_cache[path] = tex
+    return tex
+end
+
+local function apply_opacity(color, opacity)
+    if opacity == nil then
+        return color
+    end
+    if opacity < 0 then
+        opacity = 0
+    elseif opacity > 1 then
+        opacity = 1
+    end
+    local alpha = bit_rshift(color, 24)
+    local new_alpha = math_floor((alpha * opacity) + 0.5)
+    return bit_bor(bit_lshift(new_alpha, 24), bit_band(color, 0x00FFFFFF))
+end
+
+local function refresh_background_base_size()
+    if spritebg and main_bg_handle and main_bg_handle.bg_texture then
+        background_base_w = main_bg_handle.bg_texture.width or window_rect.w
+        background_base_h = main_bg_handle.bg_texture.height or window_rect.h
+        return
+    end
+    background_base_w = window_rect.w
+    background_base_h = window_rect.h
 end
 
 local function update_background_geometry()
-    local padding = BORDER_PADDING
-    local x = window_rect.x - padding
-    local y = window_rect.y - padding
-    local w = window_rect.w + (padding * 2)
-    local h = window_rect.h + (padding * 2)
-
-    if bg_rect then
-        bg_rect:set_position_x(x)
-        bg_rect:set_position_y(y)
-        bg_rect:set_width(w)
-        bg_rect:set_height(h)
-    end
-
-    background_draw.x = x
-    background_draw.y = y
-    background_draw.w = w
-    background_draw.h = h
-
-    local use_borders = is_window_theme(current_theme)
-    for _, draw in pairs(border_draw) do
-        draw.visible = false
-    end
-    if not use_borders then
+    if not spritebg or not main_bg_handle then
         return
     end
-
-    local bg_width = window_rect.w + (padding * 2)
-    local bg_height = window_rect.h + (padding * 2)
-    local bg_x = window_rect.x - padding
-    local bg_y = window_rect.y - padding
-
-    local border_size = BORDER_SIZE
-    local bg_offset = BORDER_OFFSET
-    local border_scale = BORDER_SCALE
-
-    local br_x = bg_x + bg_width - math.floor((border_size * border_scale) - (bg_offset * border_scale))
-    local br_y = bg_y + bg_height - math.floor((border_size * border_scale) - (bg_offset * border_scale))
-    border_draw.br.x = br_x
-    border_draw.br.y = br_y
-    border_draw.br.w = border_size * border_scale
-    border_draw.br.h = border_size * border_scale
-    border_draw.br.visible = true
-
-    local tr_x = br_x
-    local tr_y = bg_y - (bg_offset * border_scale)
-    local tr_h = math.ceil((br_y - tr_y) / border_scale) * border_scale
-    border_draw.tr.x = tr_x
-    border_draw.tr.y = tr_y
-    border_draw.tr.w = border_size * border_scale
-    border_draw.tr.h = tr_h
-    border_draw.tr.visible = true
-
-    local tl_x = bg_x - (bg_offset * border_scale)
-    local tl_y = bg_y - (bg_offset * border_scale)
-    local tl_w = math.ceil((tr_x - tl_x) / border_scale) * border_scale
-    border_draw.tl.x = tl_x
-    border_draw.tl.y = tl_y
-    border_draw.tl.w = tl_w
-    border_draw.tl.h = tr_h
-    border_draw.tl.visible = true
-
-    border_draw.bl.x = tl_x
-    border_draw.bl.y = br_y
-    border_draw.bl.w = tl_w
-    border_draw.bl.h = border_draw.br.h
-    border_draw.bl.visible = true
+    spritebg:set_scale(main_bg_handle, background_scale, border_scale)
+    spritebg:set_background_color(main_bg_handle, background_color)
+    spritebg:set_border_color(main_bg_handle, border_color)
+    spritebg:set_background_opacity(main_bg_handle, background_opacity)
+    spritebg:set_border_opacity(main_bg_handle, border_opacity)
+    spritebg:update_geometry(
+        main_bg_handle,
+        window_rect.x,
+        window_rect.y,
+        window_rect.w,
+        window_rect.h,
+        {
+            bg_asset = current_background_asset,
+            border_asset = current_border_asset,
+            padding = 0,
+            border_size = BORDER_SIZE,
+            border_offset = BORDER_OFFSET,
+            bg_scale = background_scale,
+            border_scale = border_scale,
+        }
+    )
 end
 
 local function update_context_menu_background_geometry()
-    local padding = BORDER_PADDING
-    local x = context_menu_x - padding
-    local y = context_menu_y - padding
-    local w = context_menu_w + (padding * 2)
-    local h = context_menu_h + (padding * 2)
-
-    if context_menu_bg_rect then
-        context_menu_bg_rect:set_position_x(x)
-        context_menu_bg_rect:set_position_y(y)
-        context_menu_bg_rect:set_width(w)
-        context_menu_bg_rect:set_height(h)
-    end
-
-    context_menu_background_draw.x = x
-    context_menu_background_draw.y = y
-    context_menu_background_draw.w = w
-    context_menu_background_draw.h = h
-
-    local use_borders = is_window_theme(context_menu_theme)
-    for _, draw in pairs(context_menu_border_draw) do
-        draw.visible = false
-    end
-    if not use_borders then
+    if not spritebg or not context_bg_handle then
         return
     end
-
-    local bg_width = context_menu_w + (padding * 2)
-    local bg_height = context_menu_h + (padding * 2)
-    local bg_x = context_menu_x - padding
-    local bg_y = context_menu_y - padding
-
-    local border_size = BORDER_SIZE
-    local bg_offset = BORDER_OFFSET
-    local border_scale = BORDER_SCALE
-
-    local br_x = bg_x + bg_width - math.floor((border_size * border_scale) - (bg_offset * border_scale))
-    local br_y = bg_y + bg_height - math.floor((border_size * border_scale) - (bg_offset * border_scale))
-    context_menu_border_draw.br.x = br_x
-    context_menu_border_draw.br.y = br_y
-    context_menu_border_draw.br.w = border_size * border_scale
-    context_menu_border_draw.br.h = border_size * border_scale
-    context_menu_border_draw.br.visible = true
-
-    local tr_x = br_x
-    local tr_y = bg_y - (bg_offset * border_scale)
-    local tr_h = math.ceil((br_y - tr_y) / border_scale) * border_scale
-    context_menu_border_draw.tr.x = tr_x
-    context_menu_border_draw.tr.y = tr_y
-    context_menu_border_draw.tr.w = border_size * border_scale
-    context_menu_border_draw.tr.h = tr_h
-    context_menu_border_draw.tr.visible = true
-
-    local tl_x = bg_x - (bg_offset * border_scale)
-    local tl_y = bg_y - (bg_offset * border_scale)
-    local tl_w = math.ceil((tr_x - tl_x) / border_scale) * border_scale
-    context_menu_border_draw.tl.x = tl_x
-    context_menu_border_draw.tl.y = tl_y
-    context_menu_border_draw.tl.w = tl_w
-    context_menu_border_draw.tl.h = tr_h
-    context_menu_border_draw.tl.visible = true
-
-    context_menu_border_draw.bl.x = tl_x
-    context_menu_border_draw.bl.y = br_y
-    context_menu_border_draw.bl.w = tl_w
-    context_menu_border_draw.bl.h = context_menu_border_draw.br.h
-    context_menu_border_draw.bl.visible = true
+    spritebg:set_scale(context_bg_handle, background_scale, border_scale)
+    spritebg:set_background_color(context_bg_handle, background_color)
+    spritebg:set_border_color(context_bg_handle, border_color)
+    spritebg:set_background_opacity(context_bg_handle, background_opacity)
+    spritebg:set_border_opacity(context_bg_handle, border_opacity)
+    spritebg:update_geometry(
+        context_bg_handle,
+        context_menu_x,
+        context_menu_y,
+        context_menu_w,
+        context_menu_h,
+        {
+            bg_asset = context_menu_background_asset,
+            border_asset = context_menu_border_asset,
+            padding = 0,
+            border_size = BORDER_SIZE,
+            border_offset = BORDER_OFFSET,
+            bg_scale = background_scale,
+            border_scale = border_scale,
+        }
+    )
 end
 
 local function get_xiui_addon_path()
@@ -493,8 +460,23 @@ local function get_xiui_addon_path()
     return addon_path_cache
 end
 
+local function load_theme_texture(theme_name, suffix)
+    local path = string_format('%sassets\\backgrounds\\%s-%s.png', addon_path_cache, theme_name, suffix)
+    local texture = load_texture(path)
+    if texture then
+        return texture
+    end
+    local xiui_path = get_xiui_addon_path()
+    if xiui_path ~= addon_path_cache then
+        local alt_path = string_format('%sassets\\backgrounds\\%s-%s.png', xiui_path, theme_name, suffix)
+        texture = load_texture(alt_path)
+    end
+    return texture
+end
+
 function renderer.initialize(addon_path)
     addon_path_cache = addon_path
+    assets_loaded = false
     
     -- Force cleanup of potential stale objects from previous crashes
     local pm = AshitaCore:GetPrimitiveManager()
@@ -517,31 +499,12 @@ function renderer.initialize(addon_path)
         fm:Delete('chatter_font_measure')
     end
 
-    local bg_settings = {
-        width = window_rect.w,
-        height = window_rect.h,
-        outline_width = 0,
-        fill_color = background_color,
-        position_x = window_rect.x,
-        position_y = window_rect.y,
-        visible = true,
-        z_order = 0,
-    }
-    bg_rect = gdi:create_rect(bg_settings, false)
-    local context_bg_settings = {
-        width = 1,
-        height = 1,
-        outline_width = 0,
-        fill_color = background_color,
-        position_x = window_rect.x,
-        position_y = window_rect.y,
-        visible = false,
-        z_order = 5,
-    }
-    context_menu_bg_rect = gdi:create_rect(context_bg_settings, false)
-
     ensure_bg_sprite()
     gdi:set_auto_render(false)
+
+    spritebg = spritebackground.new(addon_path_cache)
+    main_bg_handle = spritebg:create_handle(current_background_asset, current_border_asset, background_scale, border_scale)
+    context_bg_handle = spritebg:create_handle(context_menu_background_asset, context_menu_border_asset, background_scale, border_scale)
     
     for i = 1, pool_size do
         local sel_settings = {
@@ -629,6 +592,27 @@ function renderer.initialize(addon_path)
         z_order = 0,
     }
     measure_font = CachedFont.new(gdi:create_object(measure_settings, false))
+
+    local loading_settings = {
+        box_height = 0,
+        box_width = 0,
+        font_alignment = gdi.Alignment.Left,
+        font_color = 0xFFFFFFFF,
+        font_family = 'Arial',
+        font_flags = gdi.FontFlags.Bold,
+        font_height = font_height,
+        gradient_color = 0x00000000,
+        gradient_style = 0,
+        opacity = 1,
+        outline_color = outline_colors.on,
+        outline_width = 1,
+        position_x = 0,
+        position_y = 0,
+        text = '',
+        visible = false,
+        z_order = 3,
+    }
+    loading_font = CachedFont.new(gdi:create_object(loading_settings, false))
     
     -- 4. Register Render Loop (Only for textured background & logic updates)
     ashita.events.register('d3d_present', 'chatter_renderer_present', renderer.on_present)
@@ -636,45 +620,19 @@ function renderer.initialize(addon_path)
     print('[Chatter] Renderer initialized with gdifonts.')
 end
 
-function renderer.set_theme(theme_name)
-    current_theme = theme_name or 'Plain'
+function renderer.set_background_asset(asset_name)
+    current_background_asset = asset_name or 'Plain'
     background_dirty = true
+    assets_loaded = false
+    context_menu_background_asset = current_background_asset
 
-    if current_theme == '-None-' then
-        if bg_rect then bg_rect:set_visible(false) end
-        bg_texture = nil
-        background_theme = nil
-        for key in pairs(border_textures) do
-            border_textures[key] = nil
-        end
-        return
+    if spritebg and main_bg_handle then
+        spritebg:set_background_asset(main_bg_handle, current_background_asset)
     end
-
-    if current_theme == 'Plain' then
-        if bg_rect then
-            bg_rect:set_fill_color(background_color)
-            bg_rect:set_visible(true)
-        end
-        bg_texture = nil
-        background_theme = nil
-        for key in pairs(border_textures) do
-            border_textures[key] = nil
-        end
-    else
-        if bg_rect then
-            bg_rect:set_visible(false)
-        end
-        if background_theme ~= current_theme then
-            local tex_path = string.format('%sassets\\backgrounds\\%s-bg.png', addon_path_cache, current_theme)
-            bg_texture = load_texture(tex_path)
-            local keys = { tl = 'tl', tr = 'tr', bl = 'bl', br = 'br' }
-            for key, suffix in pairs(keys) do
-                local border_path = string.format('%sassets\\backgrounds\\%s-%s.png', addon_path_cache, current_theme, suffix)
-                border_textures[key] = load_texture(border_path)
-            end
-            background_theme = current_theme
-        end
+    if spritebg and context_bg_handle then
+        spritebg:set_background_asset(context_bg_handle, context_menu_background_asset)
     end
+    update_context_menu_layout()
 
     if background_dirty then
         update_background_geometry()
@@ -682,45 +640,38 @@ function renderer.set_theme(theme_name)
     end
 end
 
-function renderer.set_context_menu_theme(theme_name)
-    context_menu_theme = theme_name or 'Plain'
-    if context_menu_theme == '-None-' then
-        if context_menu_bg_rect then
-            context_menu_bg_rect:set_visible(false)
-        end
-        context_menu_bg_texture = nil
-        context_menu_theme_cache = nil
-        for key in pairs(context_menu_border_textures) do
-            context_menu_border_textures[key] = nil
-        end
-        update_context_menu_layout()
-        return
-    end
+function renderer.set_border_asset(asset_name)
+    current_border_asset = asset_name
+    background_dirty = true
+    assets_loaded = false
+    context_menu_border_asset = current_border_asset
 
-    if context_menu_theme == 'Plain' then
-        if context_menu_bg_rect then
-            context_menu_bg_rect:set_fill_color(background_color)
-            context_menu_bg_rect:set_visible(context_menu_visible)
-        end
-        context_menu_bg_texture = nil
-        context_menu_theme_cache = nil
-        for key in pairs(context_menu_border_textures) do
-            context_menu_border_textures[key] = nil
-        end
-    else
-        if context_menu_bg_rect then
-            context_menu_bg_rect:set_visible(false)
-        end
-        if context_menu_theme_cache ~= context_menu_theme then
-            local tex_path = string.format('%sassets\\backgrounds\\%s-bg.png', addon_path_cache, context_menu_theme)
-            context_menu_bg_texture = load_texture(tex_path)
-            local keys = { tl = 'tl', tr = 'tr', bl = 'bl', br = 'br' }
-            for key, suffix in pairs(keys) do
-                local border_path = string.format('%sassets\\backgrounds\\%s-%s.png', addon_path_cache, context_menu_theme, suffix)
-                context_menu_border_textures[key] = load_texture(border_path)
-            end
-            context_menu_theme_cache = context_menu_theme
-        end
+    if spritebg and main_bg_handle then
+        spritebg:set_border_asset(main_bg_handle, current_border_asset)
+    end
+    if spritebg and context_bg_handle then
+        spritebg:set_border_asset(context_bg_handle, context_menu_border_asset)
+    end
+    update_context_menu_layout()
+
+    if background_dirty then
+        update_background_geometry()
+        background_dirty = false
+    end
+end
+
+function renderer.set_context_menu_background_asset(asset_name)
+    context_menu_background_asset = asset_name or 'Plain'
+    if spritebg and context_bg_handle then
+        spritebg:set_background_asset(context_bg_handle, context_menu_background_asset)
+    end
+    update_context_menu_layout()
+end
+
+function renderer.set_context_menu_border_asset(asset_name)
+    context_menu_border_asset = asset_name
+    if spritebg and context_bg_handle then
+        spritebg:set_border_asset(context_bg_handle, context_menu_border_asset)
     end
     update_context_menu_layout()
 end
@@ -781,11 +732,13 @@ function renderer.set_background_color(color)
         return
     end
     background_color = color
-    if bg_rect then
-        bg_rect:set_fill_color(background_color)
-    end
-    if context_menu_bg_rect and context_menu_theme == 'Plain' then
-        context_menu_bg_rect:set_fill_color(background_color)
+    if spritebg then
+        if main_bg_handle then
+            spritebg:set_background_color(main_bg_handle, background_color)
+        end
+        if context_bg_handle then
+            spritebg:set_background_color(context_bg_handle, background_color)
+        end
     end
 end
 
@@ -794,12 +747,145 @@ function renderer.set_border_color(color)
         return
     end
     border_color = color
+    if spritebg then
+        if main_bg_handle then
+            spritebg:set_border_color(main_bg_handle, border_color)
+        end
+        if context_bg_handle then
+            spritebg:set_border_color(context_bg_handle, border_color)
+        end
+    end
+end
+
+function renderer.set_background_scale(scale)
+    if not scale then
+        return
+    end
+    background_scale = scale
+    background_dirty = true
+    if spritebg and main_bg_handle then
+        spritebg:set_scale(main_bg_handle, background_scale, border_scale)
+    end
+    if spritebg and context_bg_handle then
+        spritebg:set_scale(context_bg_handle, background_scale, border_scale)
+    end
+    update_background_geometry()
+end
+
+function renderer.set_border_scale(scale)
+    if not scale then
+        return
+    end
+    border_scale = scale
+    background_dirty = true
+    if spritebg and main_bg_handle then
+        spritebg:set_scale(main_bg_handle, background_scale, border_scale)
+    end
+    if spritebg and context_bg_handle then
+        spritebg:set_scale(context_bg_handle, background_scale, border_scale)
+    end
+    update_background_geometry()
+end
+
+function renderer.set_background_opacity(opacity)
+    if opacity == nil then
+        return
+    end
+    background_opacity = opacity
+    if spritebg then
+        if main_bg_handle then
+            spritebg:set_background_opacity(main_bg_handle, background_opacity)
+        end
+        if context_bg_handle then
+            spritebg:set_background_opacity(context_bg_handle, background_opacity)
+        end
+    end
+end
+
+function renderer.set_border_opacity(opacity)
+    if opacity == nil then
+        return
+    end
+    border_opacity = opacity
+    if spritebg then
+        if main_bg_handle then
+            spritebg:set_border_opacity(main_bg_handle, border_opacity)
+        end
+        if context_bg_handle then
+            spritebg:set_border_opacity(context_bg_handle, border_opacity)
+        end
+    end
+end
+
+function renderer.set_chat_padding(pad_x, pad_y)
+    if pad_x ~= nil then
+        if pad_x < 0 then pad_x = 0 end
+        PADDING_X = pad_x
+    end
+    if pad_y ~= nil then
+        if pad_y < 0 then pad_y = 0 end
+        PADDING_Y = pad_y
+    end
+    is_layout_dirty = true
+    is_render_dirty = true
+end
+
+function renderer.mark_geometry_ready()
+    geometry_ready = true
+end
+
+function renderer.is_geometry_ready()
+    return geometry_ready
+end
+
+local function assets_ready()
+    if not spritebg or not main_bg_handle then
+        return false
+    end
+    local bg_ready = true
+    if current_background_asset ~= '-None-' then
+        bg_ready = (main_bg_handle.bg_texture ~= nil)
+    end
+    local border_ready = true
+    if current_border_asset and current_border_asset ~= '-None-' then
+        local borders = main_bg_handle.border_textures
+        border_ready = borders and borders.corners and borders.sides
+    end
+    local fonts_ready = (#font_pool > 0)
+    return bg_ready and border_ready and fonts_ready
+end
+
+function renderer.is_assets_loaded()
+    if not assets_loaded then
+        assets_loaded = assets_ready()
+    end
+    return assets_loaded
+end
+
+function renderer.is_render_ready()
+    if not renderer.is_assets_loaded() then
+        return false
+    end
+    if style_updates_pending or is_layout_dirty or layout_task ~= nil or layout_use_task then
+        return false
+    end
+    local current_count = chatmanager.get_line_count()
+    if current_count > 0 and total_visual_lines == 0 then
+        return false
+    end
+    return true
 end
 
 function renderer.show_context_menu(x, y)
     context_menu_visible = true
     context_menu_x = x
     context_menu_y = y
+    for i = 1, #context_menu_fonts do
+        local font = context_menu_fonts[i]
+        if font then
+            font:set_z_order(10 + i)
+        end
+    end
     update_context_menu_layout()
     local max_x = window_rect.x + window_rect.w - context_menu_w
     local max_y = window_rect.y + window_rect.h - context_menu_h
@@ -868,7 +954,7 @@ function renderer.get_window_rect()
 end
 
 function renderer.get_page_size()
-    return math.floor((window_rect.h - (PADDING * 2)) / (font_height + LINE_SPACING))
+    return math.floor((window_rect.h - (PADDING_Y * 2)) / (font_height + LINE_SPACING))
 end
 
 function renderer.get_visible_line_count()
@@ -934,9 +1020,6 @@ update_context_menu_layout = function()
     end
     context_menu_w = max_width + (context_menu_padding * 2)
     context_menu_h = (#context_menu_items * (font_height + context_menu_item_spacing)) + (context_menu_padding * 2) - context_menu_item_spacing
-    if context_menu_bg_rect then
-        context_menu_bg_rect:set_visible(context_menu_theme == 'Plain' and context_menu_visible)
-    end
     update_context_menu_background_geometry()
     local start_x = context_menu_x + context_menu_padding
     local start_y = context_menu_y + context_menu_padding
@@ -1024,7 +1107,7 @@ end
 local function update_visible_layout()
     local lb_idx = 0
     
-    local max_text_width = window_rect.w - (PADDING * 2)
+    local max_text_width = window_rect.w - (PADDING_X * 2)
     if max_text_width <= 0 then max_text_width = 1 end
     
     local page_size = renderer.get_page_size()
@@ -1149,7 +1232,7 @@ local function rebuild_layout()
 end
 
 function begin_layout_task()
-    local max_text_width = window_rect.w - (PADDING * 2)
+    local max_text_width = window_rect.w - (PADDING_X * 2)
     if max_text_width <= 0 then max_text_width = 1 end
     local page_size = renderer.get_page_size()
     local layout_limit = math.max(100, page_size * 2)
@@ -1170,7 +1253,7 @@ local function step_layout_task()
     local task = layout_task
     if not task then return true end
     local lines_processed = 0
-    task.max_text_width = math_max(1, window_rect.w - (PADDING * 2))
+    task.max_text_width = math_max(1, window_rect.w - (PADDING_X * 2))
     if task.current_idx < 1 then
         total_visual_lines = 0
         render_start_index = 1
@@ -1321,6 +1404,12 @@ function renderer.update_style(family, size, bold, italic, outline_enabled, outl
         measure_font:set_font_flags(flags)
         measure_font:set_outline_color(outline_color)
     end
+    if loading_font then
+        loading_font:set_font_family(family)
+        loading_font:set_font_height(size)
+        loading_font:set_font_flags(flags)
+        loading_font:set_outline_color(outline_color)
+    end
     -- calibrate_measurement(family, size, bold, italic) -- Deprecated
 
     layout_task = nil
@@ -1375,10 +1464,14 @@ function renderer.update_fonts()
     -- Actually, if we are at bottom of history, we usually want them at bottom of screen?
     -- Let's stick to top-down rendering of the buffer.
     
-    local start_x = window_rect.x + PADDING
-    local start_y = window_rect.y + PADDING
-    local max_text_width = window_rect.w - (PADDING * 2)
+    local start_x = window_rect.x + PADDING_X
+    local start_y = window_rect.y + PADDING_Y
+    local max_text_width = window_rect.w - (PADDING_X * 2)
     local line_height = font_height + LINE_SPACING
+    local visible_lines = math.min(total_visual_lines, visible_count)
+    if visible_lines < visible_count then
+        start_y = start_y + ((visible_count - visible_lines) * line_height)
+    end
     local sel_start_line = nil
     local sel_start_char = nil
     local sel_end_line = nil
@@ -1669,6 +1762,9 @@ end
 local last_line_count = 0
 
 function renderer.on_present()
+    if not geometry_ready then
+        return
+    end
     local current_count = chatmanager.get_line_count()
     if current_count ~= last_line_count then
         last_line_count = current_count
@@ -1740,51 +1836,68 @@ function renderer.on_present()
         is_render_dirty = false
     end
 
+    if not renderer.is_assets_loaded() then
+        return
+    end
+
     if bg_sprite then
-        bg_sprite:Begin()
-        if is_window_theme(current_theme) and bg_texture then
-            draw_texture(bg_texture, background_draw.x, background_draw.y, background_draw.w, background_draw.h, 0xFFFFFFFF)
-            for key, draw in pairs(border_draw) do
-                if draw.visible and border_textures[key] then
-                    draw_texture(border_textures[key], draw.x, draw.y, draw.w, draw.h, border_color)
-                end
-            end
-        elseif bg_rect then
-            bg_rect:render(bg_sprite)
+        bg_sprite:Begin(D3DXSPRITE_ALPHABLEND)
+        if spritebg and main_bg_handle then
+            spritebg:draw_background(main_bg_handle, bg_sprite)
         end
 
-        for i = 1, #selection_rects do
-            local rect = selection_rects[i]
-            if rect then
-                rect:render(bg_sprite)
+        if renderer.is_render_ready() then
+            if loading_font then
+                loading_font:set_visible(false)
             end
-        end
 
-        for i = 1, #font_pool do
-            local font = font_pool[i]
-            if font and font.font then
-                font.font:render(bg_sprite)
+            for i = 1, #selection_rects do
+                local rect = selection_rects[i]
+                if rect then
+                    rect:render(bg_sprite)
+                end
             end
-        end
 
-        if context_menu_visible then
-            if is_window_theme(context_menu_theme) then
-                if context_menu_bg_texture then
-                    draw_texture(context_menu_bg_texture, context_menu_background_draw.x, context_menu_background_draw.y, context_menu_background_draw.w, context_menu_background_draw.h, 0xFFFFFFFF)
-                end
-                for key, draw in pairs(context_menu_border_draw) do
-                    if draw.visible and context_menu_border_textures[key] then
-                        draw_texture(context_menu_border_textures[key], draw.x, draw.y, draw.w, draw.h, border_color)
-                    end
-                end
-            elseif context_menu_bg_rect then
-                context_menu_bg_rect:render(bg_sprite)
-            end
-            for i = 1, #context_menu_fonts do
-                local font = context_menu_fonts[i]
+            for i = 1, #font_pool do
+                local font = font_pool[i]
                 if font and font.font then
                     font.font:render(bg_sprite)
                 end
+            end
+            if spritebg and main_bg_handle then
+                spritebg:draw_borders(main_bg_handle, bg_sprite)
+            end
+
+            if context_menu_visible then
+                if spritebg and context_bg_handle then
+                    spritebg:draw_background(context_bg_handle, bg_sprite)
+                end
+                for i = 1, #context_menu_fonts do
+                    local font = context_menu_fonts[i]
+                    if font and font.font then
+                        font.font:render(bg_sprite)
+                    end
+                end
+                if spritebg and context_bg_handle then
+                    spritebg:draw_borders(context_bg_handle, bg_sprite)
+                end
+            end
+        else
+            if loading_font then
+                loading_font:set_text('Loading...')
+                loading_font:set_font_color(0xFFFFFFFF)
+                local text_w, text_h = loading_font:get_text_size()
+                local x = window_rect.x + ((window_rect.w - text_w) * 0.5)
+                local y = window_rect.y + ((window_rect.h - text_h) * 0.5)
+                loading_font:set_position_x(x)
+                loading_font:set_position_y(y)
+                loading_font:set_visible(true)
+                if loading_font.font then
+                    loading_font.font:render(bg_sprite)
+                end
+            end
+            if spritebg and main_bg_handle then
+                spritebg:draw_borders(main_bg_handle, bg_sprite)
             end
         end
 
@@ -1808,11 +1921,15 @@ function renderer.dispose()
         end
         measure_font = nil
     end
+    if loading_font then
+        loading_font:set_visible(false)
+        if loading_font.font then
+            gdi:destroy_object(loading_font.font)
+        end
+        loading_font = nil
+    end
 
     bg_texture = nil
-    for key in pairs(border_textures) do
-        border_textures[key] = nil
-    end
     bg_sprite = nil
 
     if selection_rects then
@@ -1840,9 +1957,6 @@ function renderer.dispose()
         context_menu_fonts[i] = nil
     end
     context_menu_bg_texture = nil
-    for key in pairs(context_menu_border_textures) do
-        context_menu_border_textures[key] = nil
-    end
 
     gdi:destroy_interface()
 end
