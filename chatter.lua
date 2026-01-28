@@ -110,6 +110,27 @@ local function apply_default_value(value, default)
     return value
 end
 
+local function normalize_context_menu_config(cfg, defaults_cfg)
+    local out = T{ items = T{} }
+    local used = {}
+    if cfg and cfg.items then
+        for _, item in ipairs(cfg.items) do
+            if item and item.label then
+                table.insert(out.items, { label = item.label, enabled = item.enabled ~= false })
+                used[item.label] = true
+            end
+        end
+    end
+    if defaults_cfg and defaults_cfg.items then
+        for _, item in ipairs(defaults_cfg.items) do
+            if item and item.label and not used[item.label] then
+                table.insert(out.items, { label = item.label, enabled = item.enabled ~= false })
+            end
+        end
+    end
+    return out
+end
+
 local default_chat_colors = defaults.chat_colors
 local default_self_colors = defaults.self_colors
 local default_system_colors = defaults.system_colors
@@ -125,6 +146,7 @@ config.padding_x = apply_default_value(config.padding_x, defaults.chatter_settin
 config.padding_y = apply_default_value(config.padding_y, defaults.chatter_settings.padding_y)
 config.background_color = apply_default_value(config.background_color, defaults.chatter_settings.background_color)
 config.border_color = apply_default_value(config.border_color, defaults.chatter_settings.border_color)
+config.context_menu_config = apply_default_value(config.context_menu_config, defaults.chatter_settings.context_menu_config)
 config.font_family = apply_default_value(config.font_family, defaults.chatter_settings.font_family)
 config.font_size = apply_default_value(config.font_size, defaults.chatter_settings.font_size)
 config.font_bold = apply_default_value(config.font_bold, defaults.chatter_settings.font_bold)
@@ -135,6 +157,7 @@ config.colors.chat = apply_default_value(config.colors.chat, T{})
 config.colors.self = apply_default_value(config.colors.self, T{})
 config.colors.others = apply_default_value(config.colors.others, T{})
 config.colors.system = apply_default_value(config.colors.system, T{})
+config.context_menu_config = normalize_context_menu_config(config.context_menu_config, defaults.chatter_settings.context_menu_config)
 
 for k, v in pairs(default_chat_colors) do
     if config.colors.chat[k] == nil then
@@ -302,6 +325,7 @@ local function edit_color(label, tbl, key)
 end
 
 local show_config = false
+local show_context_settings = false
 local current_config_section = 'General'
 local is_dragging = false
 local is_resizing = false
@@ -324,6 +348,20 @@ local drag_threshold = 5
 local anchor_start_abs = nil
 local anchor_end_abs = nil
 local imgui_wants_mouse = false
+local context_drag_src_index = nil
+
+local function get_enabled_context_menu_items()
+    local out = {}
+    local cfg = config.context_menu_config
+    if cfg and cfg.items then
+        for _, it in ipairs(cfg.items) do
+            if it.enabled then
+                table.insert(out, it.label)
+            end
+        end
+    end
+    return out
+end
 
 -- Initialize
 ashita.events.register('load', 'chatter_load', function()
@@ -349,6 +387,7 @@ ashita.events.register('load', 'chatter_load', function()
     renderer.set_border_opacity(config.border_opacity or 1.0)
     renderer.set_context_menu_opacity(1.0)
     renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
+    renderer.set_context_menu_items(get_enabled_context_menu_items())
 
     resize_icon_path = addon.path .. 'assets\\backgrounds\\resize.png'
     update_resize_icon_cache()
@@ -648,8 +687,9 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
     local io = imgui.GetIO()
     imgui_wants_mouse = io.WantCaptureMouse
     
-    if not show_config then return end
+    if not show_config and not show_context_settings then return end
     
+    if show_config then
     local font_options = {
         'Arial',
         'Calibri',
@@ -688,7 +728,6 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
     local buttonHoverColor = bgLight
     local buttonActiveColor = bgLighter
 
-    if show_config then
         imgui.PushStyleColor(ImGuiCol_WindowBg, bgColor)
         imgui.PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0})
         imgui.PushStyleColor(ImGuiCol_TitleBg, bgMedium)
@@ -787,6 +826,15 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
     if config_visible and current_config_section == 'General' then
         if imgui.BeginTabBar("ChatterGeneralTabs") then
             if imgui.BeginTabItem("General") then
+                imgui.Text("Chat Window Settings")
+                imgui.Separator()
+
+                local lock_val = { config.lock_window }
+                if imgui.Checkbox("Lock Window (Hide Resize Icon)", lock_val) then
+                    config.lock_window = lock_val[1]
+                    request_save()
+                end
+
                 local function scan_assets()
                     local root = addon.path .. 'assets\\backgrounds\\'
                     local function file_exists(path)
@@ -936,11 +984,12 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                     renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
                     request_save()
                 end
-
-                local lock_val = { config.lock_window }
-                if imgui.Checkbox("Lock Window (Hide Resize Icon)", lock_val) then
-                    config.lock_window = lock_val[1]
-                    request_save()
+                
+                imgui.Spacing()
+                imgui.Text("Context Menu Settings")
+                imgui.Separator()
+                if imgui.Button("Open Context Menu Settings", {220, 24}) then
+                    show_context_settings = true
                 end
 
                 imgui.EndTabItem()
@@ -1134,6 +1183,133 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
         
         imgui.End()
 
+        imgui.PopStyleVar(8)
+        imgui.PopStyleColor(31)
+    end
+    
+    if show_context_settings then
+        local accent = {0.30, 0.55, 0.95, 1.0}
+        local accentDark = {0.20, 0.40, 0.75, 1.0}
+        local accentDarker = {0.12, 0.28, 0.55, 1.0}
+        local accentLight = {0.40, 0.65, 0.98, 1.0}
+        local bgDark = {0.050, 0.055, 0.070, 0.95}
+        local bgMedium = {0.070, 0.080, 0.100, 1.0}
+        local bgLight = {0.095, 0.105, 0.130, 1.0}
+        local bgLighter = {0.120, 0.135, 0.165, 1.0}
+        local textLight = {0.900, 0.920, 0.950, 1.0}
+        local borderDark = {0.16, 0.24, 0.40, 1.0}
+
+        imgui.PushStyleColor(ImGuiCol_WindowBg, bgDark)
+        imgui.PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0})
+        imgui.PushStyleColor(ImGuiCol_TitleBg, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_TitleBgActive, bgLight)
+        imgui.PushStyleColor(ImGuiCol_TitleBgCollapsed, bgDark)
+        imgui.PushStyleColor(ImGuiCol_FrameBg, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_FrameBgHovered, bgLight)
+        imgui.PushStyleColor(ImGuiCol_FrameBgActive, bgLighter)
+        imgui.PushStyleColor(ImGuiCol_Header, bgLight)
+        imgui.PushStyleColor(ImGuiCol_HeaderHovered, bgLighter)
+        imgui.PushStyleColor(ImGuiCol_HeaderActive, {accent[1], accent[2], accent[3], 0.35})
+        imgui.PushStyleColor(ImGuiCol_Border, borderDark)
+        imgui.PushStyleColor(ImGuiCol_Text, textLight)
+        imgui.PushStyleColor(ImGuiCol_TextDisabled, {0.55, 0.62, 0.78, 1.0})
+        imgui.PushStyleColor(ImGuiCol_Button, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, bgLight)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive, bgLighter)
+        imgui.PushStyleColor(ImGuiCol_CheckMark, accent)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarBg, bgMedium)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarGrab, accentDarker)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarGrabHovered, accentDark)
+        imgui.PushStyleColor(ImGuiCol_ScrollbarGrabActive, accent)
+        imgui.PushStyleColor(ImGuiCol_ResizeGrip, {accent[1], accent[2], accent[3], 0.35})
+        imgui.PushStyleColor(ImGuiCol_ResizeGripHovered, accentLight)
+        imgui.PushStyleColor(ImGuiCol_ResizeGripActive, accent)
+
+        imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {12, 12})
+        imgui.PushStyleVar(ImGuiStyleVar_FramePadding, {6, 4})
+        imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, 6})
+        imgui.PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0)
+        imgui.PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 4.0)
+        imgui.PushStyleVar(ImGuiStyleVar_GrabRounding, 4.0)
+
+        imgui.SetNextWindowSize({ 500, 480 }, ImGuiCond_FirstUseEver)
+        local open_buf = { show_context_settings }
+        local visible = imgui.Begin("Context Menu Settings", open_buf, 0)
+        show_context_settings = open_buf[1]
+        if visible then
+            imgui.Text("Customize the context menu options that appear.")
+            imgui.Separator()
+            imgui.Columns(2, "ContextMenuColumns", false)
+            imgui.SetColumnWidth(0, 28)
+            if config.context_menu_config and config.context_menu_config.items then
+                local draw_list = imgui.GetWindowDrawList()
+                local window_pos_x, window_pos_y = imgui.GetWindowPos()
+                local content_min_x, content_min_y = imgui.GetWindowContentRegionMin()
+                local content_max_x, content_max_y = imgui.GetWindowContentRegionMax()
+                local row_min_x = window_pos_x + content_min_x
+                local row_max_x = window_pos_x + content_max_x
+                local mouse_x, mouse_y = imgui.GetMousePos()
+                local dot_color = color_to_argb({accent[1], accent[2], accent[3], 1.0})
+                local hover_color = color_to_argb({accent[1], accent[2], accent[3], 0.18})
+                for i, item in ipairs(config.context_menu_config.items) do
+                    local row_start_x, row_start_y = imgui.GetCursorScreenPos()
+                    local row_min_y = row_start_y
+                    local row_max_y = row_min_y + imgui.GetFrameHeight()
+                    local row_hovered = (mouse_x >= row_min_x and mouse_x <= row_max_x and mouse_y >= row_min_y and mouse_y <= row_max_y)
+                    if row_hovered then
+                        draw_list:AddRectFilled({row_min_x, row_min_y}, {row_max_x, row_max_y}, hover_color)
+                    end
+                    imgui.PushID(i)
+                    imgui.InvisibleButton("##grip", {20, 20})
+                    local grip_min_x, grip_min_y = imgui.GetItemRectMin()
+                    local grip_max_x, grip_max_y = imgui.GetItemRectMax()
+                    local grip_center_x = (grip_min_x + grip_max_x) * 0.5
+                    local grip_center_y = (grip_min_y + grip_max_y) * 0.5
+                    local dot_half = 1.5
+                    local dot_spacing = 4
+                    for d = -1, 1 do
+                        local y = grip_center_y + (d * dot_spacing)
+                        draw_list:AddRectFilled(
+                            {grip_center_x - dot_half, y - dot_half},
+                            {grip_center_x + dot_half, y + dot_half},
+                            dot_color
+                        )
+                    end
+                    if imgui.IsItemActive() and imgui.IsMouseDragging(0) then
+                        context_drag_src_index = i
+                    end
+                    imgui.NextColumn()
+                    local chk = { item.enabled }
+                    if imgui.Checkbox(item.label, chk) then
+                        item.enabled = chk[1]
+                        renderer.set_context_menu_items(get_enabled_context_menu_items())
+                        request_save()
+                    end
+                    if context_drag_src_index and imgui.IsMouseReleased(0) and row_hovered then
+                        local src = context_drag_src_index
+                        local dest = i
+                        if src ~= dest then
+                            local moved = table.remove(config.context_menu_config.items, src)
+                            table.insert(config.context_menu_config.items, dest, moved)
+                            renderer.set_context_menu_items(get_enabled_context_menu_items())
+                            request_save()
+                        end
+                        context_drag_src_index = nil
+                    end
+                    imgui.NextColumn()
+                    imgui.PopID()
+                end
+                if context_drag_src_index and imgui.IsMouseReleased(0) then
+                    context_drag_src_index = nil
+                end
+            end
+            imgui.Columns(1)
+            imgui.End()
+        else
+            imgui.End()
+        end
         imgui.PopStyleVar(8)
         imgui.PopStyleColor(31)
     end

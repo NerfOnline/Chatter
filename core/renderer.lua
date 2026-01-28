@@ -139,6 +139,10 @@ local font_pool = {}
 local font_cache = {}
 local pool_size = 200
 local font_height = 14
+local current_font_family = 'Arial'
+local current_font_flags = gdi.FontFlags.Bold
+local current_outline_color = 0xFF000000
+local current_outline_width = 1
 
 -- Layout Store (SoA)
 local layout_store = {
@@ -460,6 +464,30 @@ local function update_context_menu_background_geometry()
     )
 end
 
+local function create_context_menu_font()
+    local font_settings = {
+        box_height = 0,
+        box_width = 0,
+        font_alignment = gdi.Alignment.Left,
+        font_color = 0xFFFFFFFF,
+        font_family = current_font_family,
+        font_flags = current_font_flags,
+        font_height = font_height,
+        gradient_color = 0x00000000,
+        gradient_style = 0,
+        opacity = 1,
+        outline_color = current_outline_color,
+        outline_width = current_outline_width,
+        position_x = 0,
+        position_y = 0,
+        text = '',
+        visible = false,
+        z_order = 6,
+    }
+    local font = gdi:create_object(font_settings, false)
+    return CachedFont.new(font)
+end
+
 local function get_xiui_addon_path()
     local lower = addon_path_cache:lower()
     local idx = lower:find('\\chatter\\', 1, true) or lower:find('/chatter/', 1, true)
@@ -558,27 +586,7 @@ function renderer.initialize(addon_path)
     end
 
     for i = 1, #context_menu_items do
-        local font_settings = {
-            box_height = 0,
-            box_width = 0,
-            font_alignment = gdi.Alignment.Left,
-            font_color = 0xFFFFFFFF,
-            font_family = 'Arial',
-            font_flags = gdi.FontFlags.Bold,
-            font_height = font_height,
-            gradient_color = 0x00000000,
-            gradient_style = 0,
-            opacity = 1,
-            outline_color = outline_colors.on,
-            outline_width = 1,
-            position_x = 0,
-            position_y = 0,
-            text = '',
-            visible = false,
-            z_order = 6,
-        }
-        local font = gdi:create_object(font_settings, false)
-        context_menu_fonts[i] = CachedFont.new(font)
+        context_menu_fonts[i] = create_context_menu_font()
     end
     
     local measure_settings = {
@@ -683,6 +691,31 @@ function renderer.set_context_menu_border_asset(asset_name)
         spritebg:set_border_asset(context_bg_handle, context_menu_border_asset)
     end
     update_context_menu_layout()
+end
+
+function renderer.set_context_menu_items(items)
+    if items == nil then
+        items = {}
+    end
+    context_menu_items = items
+    local needed = #context_menu_items
+    local current = #context_menu_fonts
+    if needed > current then
+        for i = current + 1, needed do
+            context_menu_fonts[i] = create_context_menu_font()
+        end
+    elseif needed < current then
+        for i = current, needed + 1, -1 do
+            local font = context_menu_fonts[i]
+            if font and font.font then
+                gdi:destroy_object(font.font)
+            end
+            context_menu_fonts[i] = nil
+        end
+    end
+    if context_menu_visible then
+        update_context_menu_layout()
+    end
 end
 
 function renderer.update_geometry(x, y, w, h)
@@ -1515,6 +1548,9 @@ function renderer.update_style(family, size, bold, italic, outline_enabled, outl
     if italic then
         flags = bit.bor(flags, gdi.FontFlags.Italic)
     end
+    current_font_family = family
+    current_font_flags = flags
+    current_outline_color = outline_color
     pending_style.family = family
     pending_style.size = size
     pending_style.flags = flags

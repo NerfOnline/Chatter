@@ -109,6 +109,14 @@ local chatter_settings = T{
     background_color = {0.8235, 0.7843, 1.0, 0.7020},
     border_color = {0.8235, 0.7843, 1.0, 1.0},
     outline_color = {0.0, 0.0, 0.0, 1.0},
+    context_menu_config = T{
+        items = T{
+            { label = 'Copy Selected Text', enabled = true },
+            { label = 'Send Tell', enabled = true },
+            { label = 'Customize Context Menu', enabled = true },
+            { label = 'Open Configuration', enabled = true },
+        },
+    },
     colors = T{
         chat = T{
             say = {1.0, 1.0, 1.0, 1.0},
