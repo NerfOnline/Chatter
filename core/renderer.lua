@@ -24,6 +24,12 @@ local bit_lshift = bit.lshift
 local bit_rshift = bit.rshift
 
 local measurement_cache = {}
+local substring_width_cache = {}
+local substring_cache_entries = 0
+local SUBSTRING_CACHE_LIMIT = 6000
+local wrap_cache = {}
+local wrap_cache_entries = 0
+local WRAP_CACHE_LIMIT = 800
 
 local CachedFont = {}
 CachedFont.__index = CachedFont
@@ -131,7 +137,7 @@ end
 
 local font_pool = {}
 local font_cache = {}
-local pool_size = 50
+local pool_size = 200
 local font_height = 14
 
 -- Layout Store (SoA)
@@ -169,6 +175,7 @@ local assets_loaded = false
 local layout_task = nil
 local layout_rebuild_mode = 'immediate'
 local layout_lines_per_frame = 8
+local default_layout_lines_per_frame = 8
 local last_layout_time = 0
 local LAYOUT_THROTTLE_DELAY = 0.05
 local layout_use_task = false
@@ -195,6 +202,8 @@ local loading_font = nil
 
 local selection_rects = {}
 local addon_path_cache = ''
+local render_ready_once = false
+local preload_resize_done = false
 
 local bg_sprite = nil
 local bg_texture = nil
@@ -431,8 +440,8 @@ local function update_context_menu_background_geometry()
     spritebg:set_scale(context_bg_handle, background_scale, border_scale)
     spritebg:set_background_color(context_bg_handle, background_color)
     spritebg:set_border_color(context_bg_handle, border_color)
-    spritebg:set_background_opacity(context_bg_handle, background_opacity)
-    spritebg:set_border_opacity(context_bg_handle, border_opacity)
+    spritebg:set_background_opacity(context_bg_handle, 1.0)
+    spritebg:set_border_opacity(context_bg_handle, 1.0)
     spritebg:update_geometry(
         context_bg_handle,
         context_menu_x,
@@ -720,10 +729,14 @@ function renderer.set_resizing(flag)
         layout_task = nil
         layout_use_task = false
         is_layout_dirty = true
+        if layout_lines_per_frame < MAX_LINES_PER_FRAME then
+            layout_lines_per_frame = MAX_LINES_PER_FRAME
+        end
     else
         is_resizing = false
         layout_task = nil
         is_layout_dirty = true
+        layout_lines_per_frame = default_layout_lines_per_frame
     end
 end
 
@@ -796,9 +809,6 @@ function renderer.set_background_opacity(opacity)
         if main_bg_handle then
             spritebg:set_background_opacity(main_bg_handle, background_opacity)
         end
-        if context_bg_handle then
-            spritebg:set_background_opacity(context_bg_handle, background_opacity)
-        end
     end
 end
 
@@ -811,9 +821,16 @@ function renderer.set_border_opacity(opacity)
         if main_bg_handle then
             spritebg:set_border_opacity(main_bg_handle, border_opacity)
         end
-        if context_bg_handle then
-            spritebg:set_border_opacity(context_bg_handle, border_opacity)
-        end
+    end
+end
+
+function renderer.set_context_menu_opacity(opacity)
+    if opacity == nil then
+        opacity = 1.0
+    end
+    if spritebg and context_bg_handle then
+        spritebg:set_background_opacity(context_bg_handle, opacity)
+        spritebg:set_border_opacity(context_bg_handle, opacity)
     end
 end
 
@@ -1007,6 +1024,82 @@ local function measure_text(text)
     return w
 end
 
+local function measure_substring(text, start_pos, end_pos)
+    if not text or text == "" then
+        return 0
+    end
+    if end_pos < start_pos then
+        return 0
+    end
+    local text_cache = substring_width_cache[text]
+    local key = start_pos .. ':' .. end_pos
+    if text_cache then
+        local cached = text_cache[key]
+        if cached ~= nil then
+            return cached
+        end
+    end
+    local chunk = string_sub(text, start_pos, end_pos)
+    local w = measure_text(chunk)
+    if not text_cache then
+        text_cache = {}
+        substring_width_cache[text] = text_cache
+    end
+    text_cache[key] = w
+    substring_cache_entries = substring_cache_entries + 1
+    if substring_cache_entries > SUBSTRING_CACHE_LIMIT then
+        substring_width_cache = {}
+        substring_cache_entries = 0
+    end
+    return w
+end
+
+local compute_wrap_length
+
+local function get_wrap_entry(line_id, line_index, text, max_text_width)
+    local width_key = math_floor(max_text_width / 4) * 4
+    if width_key < 1 then width_key = 1 end
+    local key = line_id or (-line_index)
+    local line_cache = wrap_cache[key]
+    if line_cache then
+        local cached = line_cache[width_key]
+        if cached and cached.len == #text then
+            return cached
+        end
+    end
+    local starts = {}
+    local ends = {}
+    local len = #text
+    local seg_count = 0
+    if len == 0 then
+        seg_count = 1
+        starts[1] = 1
+        ends[1] = 0
+    else
+        local pos = 1
+        while pos <= len do
+            local slice_len = compute_wrap_length(text, pos, max_text_width)
+            if slice_len <= 0 then slice_len = len - pos + 1 end
+            seg_count = seg_count + 1
+            starts[seg_count] = pos
+            ends[seg_count] = pos + slice_len - 1
+            pos = pos + slice_len
+        end
+    end
+    local entry = { len = len, count = seg_count, starts = starts, ends = ends }
+    if not line_cache then
+        line_cache = {}
+        wrap_cache[key] = line_cache
+    end
+    line_cache[width_key] = entry
+    wrap_cache_entries = wrap_cache_entries + 1
+    if wrap_cache_entries > WRAP_CACHE_LIMIT then
+        wrap_cache = {}
+        wrap_cache_entries = 0
+    end
+    return entry
+end
+
 update_context_menu_layout = function()
     if not context_menu_visible then
         return
@@ -1034,7 +1127,7 @@ update_context_menu_layout = function()
     end
 end
 
-local function compute_wrap_length(text, start_pos, max_width)
+compute_wrap_length = function(text, start_pos, max_width)
     if not text or text == "" then
         return 0
     end
@@ -1048,15 +1141,13 @@ local function compute_wrap_length(text, start_pos, max_width)
     if max_width <= 0 then
         return available
     end
-
     -- Optimization: Check if the rest of the string fits (up to a reasonable limit)
     -- This avoids binary search for short lines (common case) and massive allocs for huge lines.
     local limit = 1000
     local check_len = math_min(available, limit)
     
     -- We must measure the chunk to know if it fits.
-    local check_chunk = string_sub(text, start_pos, start_pos + check_len - 1)
-    local check_w = measure_text(check_chunk)
+    local check_w = measure_substring(text, start_pos, start_pos + check_len - 1)
     
     if check_w <= max_width then
         -- If the checked chunk fits, and it was the whole available text, return it.
@@ -1068,20 +1159,35 @@ local function compute_wrap_length(text, start_pos, max_width)
         return limit
     end
 
-    -- Binary search for the split point within [1, check_len]
     local low = 1
-    local high = check_len
+    local high = 1
     local best = 1
-    
-    while low <= high do
-        local mid = math_floor((low + high) / 2)
-        local chunk = string_sub(text, start_pos, start_pos + mid - 1)
-        local w = measure_text(chunk)
+    local step = 1
+    while high < check_len do
+        local probe = math_min(check_len, high + step)
+        local w = measure_substring(text, start_pos, start_pos + probe - 1)
         if w > max_width then
-            high = mid - 1
-        else
-            best = mid
-            low = mid + 1
+            high = probe
+            break
+        end
+        best = probe
+        low = probe + 1
+        high = probe
+        step = step * 2
+    end
+    if best < check_len then
+        if high < low then
+            high = low
+        end
+        while low <= high do
+            local mid = math_floor((low + high) / 2)
+            local w = measure_substring(text, start_pos, start_pos + mid - 1)
+            if w > max_width then
+                high = mid - 1
+            else
+                best = mid
+                low = mid + 1
+            end
         end
     end
     
@@ -1096,6 +1202,72 @@ local function compute_wrap_length(text, start_pos, max_width)
     end
     
     return best
+end
+
+local function preload_resize_data()
+    if preload_resize_done or not measure_font then
+        return
+    end
+    local count = chatmanager.get_line_count()
+    local width_base = math_max(1, window_rect.w - (PADDING_X * 2))
+    local widths = {
+        width_base,
+        math_max(1, math_floor(width_base * 0.9)),
+        math_max(1, math_floor(width_base * 0.8)),
+        math_max(1, math_floor(width_base * 0.7)),
+        math_max(1, math_floor(width_base * 0.6)),
+        math_max(1, math_floor(width_base * 0.55)),
+        math_max(1, math_floor(width_base * 0.5)),
+        math_max(1, math_floor(width_base * 1.15)),
+        math_max(1, math_floor(width_base * 1.25))
+    }
+    if count > 0 then
+        local sample_count = math_min(40, count)
+        local start_idx = math_max(1, count - sample_count + 1)
+        for i = start_idx, count do
+            local text = chatmanager.get_line_text(i) or ""
+            if text ~= "" then
+                measure_text(text)
+                local len = #text
+                local step = math_max(1, math_floor(len / 3))
+                local pos = 1
+                while pos <= len do
+                    local e = math_min(len, pos + step - 1)
+                    measure_substring(text, pos, e)
+                    pos = pos + step
+                end
+            else
+                measure_text("")
+            end
+            local line_id = chatmanager.get_line_id(i)
+            for _, w in ipairs(widths) do
+                get_wrap_entry(line_id, i, text, w)
+            end
+        end
+    else
+        local samples = {
+            "Preloading...",
+            "The quick brown fox jumps over the lazy dog.",
+            "1234567890",
+            "This is a longer line used to warm word wrap measurements."
+        }
+        for i = 1, #samples do
+            local text = samples[i]
+            measure_text(text)
+            local len = #text
+            local step = math_max(1, math_floor(len / 3))
+            local pos = 1
+            while pos <= len do
+                local e = math_min(len, pos + step - 1)
+                measure_substring(text, pos, e)
+                pos = pos + step
+            end
+            for _, w in ipairs(widths) do
+                get_wrap_entry(nil, -i, text, w)
+            end
+        end
+    end
+    preload_resize_done = true
 end
 
 local MAX_PAGE_MULTIPLIER = 4
@@ -1147,32 +1319,14 @@ local function update_visible_layout()
         local len = #text
         local line_id = chatmanager.get_line_id(current_idx)
         
-        -- Reuse line_segments_buffer
-        local seg_count = 0
-        
-        if len == 0 then
-            seg_count = 1
-            line_segments_buffer.start_char[1] = 1
-            line_segments_buffer.end_char[1] = 0
-        else
-            local pos = 1
-                while pos <= len do
-                    local slice_len = compute_wrap_length(text, pos, max_text_width)
-                    if slice_len <= 0 then slice_len = len - pos + 1 end
-                    
-                    seg_count = seg_count + 1
-                    line_segments_buffer.start_char[seg_count] = pos
-                    line_segments_buffer.end_char[seg_count] = pos + slice_len - 1
-                    
-                    pos = pos + slice_len
-                end
-        end
+        local entry = get_wrap_entry(line_id, current_idx, text, max_text_width)
+        local seg_count = entry.count
         
         for i = seg_count, 1, -1 do
             lb_idx = lb_idx + 1
             layout_buffer.line_index[lb_idx] = current_idx
-            layout_buffer.start_char[lb_idx] = line_segments_buffer.start_char[i]
-            layout_buffer.end_char[lb_idx] = line_segments_buffer.end_char[i]
+            layout_buffer.start_char[lb_idx] = entry.starts[i]
+            layout_buffer.end_char[lb_idx] = entry.ends[i]
             local s = layout_buffer.start_char[lb_idx]
             local e = layout_buffer.end_char[lb_idx]
             if line_id then
@@ -1277,29 +1431,14 @@ local function step_layout_task()
         local text = chatmanager.get_line_text(task.current_idx) or ""
         local len = #text
         local line_id = chatmanager.get_line_id(task.current_idx)
-        local seg_count = 0
-
-        if len == 0 then
-            seg_count = 1
-            line_segments_buffer.start_char[1] = 1
-            line_segments_buffer.end_char[1] = 0
-        else
-            local pos = 1
-            while pos <= len do
-                local slice_len = compute_wrap_length(text, pos, task.max_text_width)
-                if slice_len <= 0 then slice_len = len - pos + 1 end
-                seg_count = seg_count + 1
-                line_segments_buffer.start_char[seg_count] = pos
-                line_segments_buffer.end_char[seg_count] = pos + slice_len - 1
-                pos = pos + slice_len
-            end
-        end
+        local entry = get_wrap_entry(line_id, task.current_idx, text, task.max_text_width)
+        local seg_count = entry.count
 
         for i = seg_count, 1, -1 do
             task.lb_idx = task.lb_idx + 1
             layout_buffer.line_index[task.lb_idx] = task.current_idx
-            layout_buffer.start_char[task.lb_idx] = line_segments_buffer.start_char[i]
-            layout_buffer.end_char[task.lb_idx] = line_segments_buffer.end_char[i]
+            layout_buffer.start_char[task.lb_idx] = entry.starts[i]
+            layout_buffer.end_char[task.lb_idx] = entry.ends[i]
             local s = layout_buffer.start_char[task.lb_idx]
             local e = layout_buffer.end_char[task.lb_idx]
             if line_id then
@@ -1358,6 +1497,7 @@ end
 
 function renderer.update_style(family, size, bold, italic, outline_enabled, outline_argb)
     measurement_cache = {}
+    preload_resize_done = false
     font_height = size
     if bold == nil then bold = true end
     if italic == nil then italic = false end
@@ -1427,6 +1567,10 @@ end
 function renderer.update_fonts()
     local page_size = renderer.get_page_size()
     local visible_count = math.min(pool_size, page_size)
+    if total_visual_lines < visible_count and not is_layout_dirty and layout_task == nil then
+        layout_use_task = true
+        is_layout_dirty = true
+    end
     -- rebuild_layout called separately
     if is_layout_dirty and layout_task == nil and not layout_use_task then
         update_visible_layout()
@@ -1448,7 +1592,7 @@ function renderer.update_fonts()
     -- With virtual layout, we just render everything in layout_store from start
     -- because layout_store ONLY contains what fits on screen (or slightly more)
     
-    local start_index = render_start_index
+    local start_index = math_max(1, total_visual_lines - visible_count + 1)
     -- local end_index = math.min(total_visual_lines, visible_count) -- Unused
     
     -- If we have fewer lines than page_size, we might need to adjust start_y 
@@ -1465,13 +1609,10 @@ function renderer.update_fonts()
     -- Let's stick to top-down rendering of the buffer.
     
     local start_x = window_rect.x + PADDING_X
-    local start_y = window_rect.y + PADDING_Y
     local max_text_width = window_rect.w - (PADDING_X * 2)
     local line_height = font_height + LINE_SPACING
     local visible_lines = math.min(total_visual_lines, visible_count)
-    if visible_lines < visible_count then
-        start_y = start_y + ((visible_count - visible_lines) * line_height)
-    end
+    local start_y = (window_rect.y + window_rect.h - PADDING_Y) - (visible_lines * line_height)
     local sel_start_line = nil
     local sel_start_char = nil
     local sel_end_line = nil
@@ -1846,7 +1987,11 @@ function renderer.on_present()
             spritebg:draw_background(main_bg_handle, bg_sprite)
         end
 
-        if renderer.is_render_ready() then
+        local render_ready = renderer.is_render_ready()
+        if render_ready then
+            render_ready_once = true
+        end
+        if render_ready_once then
             if loading_font then
                 loading_font:set_visible(false)
             end
@@ -1883,6 +2028,7 @@ function renderer.on_present()
                 end
             end
         else
+            preload_resize_data()
             if loading_font then
                 loading_font:set_text('Loading...')
                 loading_font:set_font_color(0xFFFFFFFF)

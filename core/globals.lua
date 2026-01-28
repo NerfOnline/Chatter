@@ -1,6 +1,7 @@
 -- Global Helper Functions
 require('common')
 local ashita_settings = require('settings')
+local defaults = require('config.defaults')
 
 function S(t)
     local s = {}
@@ -83,82 +84,7 @@ find_table = {
 	['last_index'] = 1,
 }
 
-default_settings = T{
-	log_length = 12,
-	log_width = 500,
-	log_dwidth = 0, -- 0 Disables and defaults to log_width value
-	log_dlength = 0, -- 0 Disable and defaults to log_length value
-	battle_all = true, -- Display Battle text in All tab
-	battle_off = false, -- Disable processing Battle text entirely
-	strict_width = true,
-	strict_length = true,
-	undocked_window = false,
-	undocked_tab = 'General', -- Default to General if all_tabname matches
-	undocked_hide = false,
-	incoming_pause = false,
-	drag_status = true,
-	battle_flash = false,
-	snapback = true,
-	chat_input = false,
-	chat_input_placement = 1,
-	split_drops = false,
-	drops_window = true,
-	enh_whitespace = true,
-	archive = false,
-	vanilla_mode = false,
-	time_format = '24h', -- '24h' or '12h'
-	flags = {
-		draggable = false,
-		bold = false,
-	},
-	mentions = {
-		All = S{},
-		Tell = S{},
-		Linkshell = S{},
-		Linkshell2 = S{},
-		Party = S{},
-		Battle = S{},
-	},
-	text = {
-		font = 'Lucida Sans Typewriter',
-		custom_font_name = '',
-		fonts = {
-            'Arial', 'Calibri', 'Cambria', 'Cambria Math', 'Candara', 
-            'Cascadia Code', 'Cascadia Mono', 'Comic Sans MS', 'Consolas', 
-            'Courier New', 'Georgia', 'Impact', 'Lucida Console', 
-            'Lucida Sans', 'Lucida Sans Typewriter', 'Tahoma', 
-            'Times New Roman', 'Trebuchet MS', 'Verdana', 'Other'
-        },
-		size = 10,
-		outline = 1,
-		line_spacing = 4,
-		style = 'Regular', -- Regular, Bold, Italic, Bold Italic
-		alpha = 255,
-		red = 255,
-		green = 255,
-		blue = 255,
-		stroke = {
-			width = 1,
-			alpha = 255,
-			red = 0,
-			green = 0,
-			blue = 0,
-		}
-	},
-	bg = {
-		theme = 'Plain', -- Plain, Window1-8
-		alpha = 255,
-		red = 0,
-		green = 0,
-		blue = 0,
-	},
-    window = {
-        x = 100,
-        y = 100,
-        w = 600,
-        h = 400,
-    },
-}
+default_settings = defaults.global_settings
 
 tab_ids = {}
 all_tabs = {}

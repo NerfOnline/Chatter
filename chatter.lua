@@ -7,6 +7,7 @@ local chatmanager = require('core.chatmanager')
 local renderer = require('core.renderer')
 local imgui = require('imgui')
 local settings = require('settings')
+local defaults = require('config.defaults')
 local ffi = require('ffi')
 local bit = require('bit')
 
@@ -97,89 +98,76 @@ local function copy_to_clipboard(text)
     end
 end
 
-config = settings.load(T{
-    theme = 'Plain',
-    background_asset = 'Progressive-Blue',
-    border_asset = 'Silent-Reach',
-    context_menu_theme = 'Progressive-Blue',
-    font_family = 'Arial',
-    font_size = 14,
-    font_bold = true,
-    font_italic = false,
-    outline_enabled = true,
-    window_x = 100,
-    window_y = 100,
-    window_w = 600,
-    window_h = 400,
-    lock_window = false,
-    padding_x = 5,
-    padding_y = 5,
-    background_scale = 1.0,
-    border_scale = 1.0,
-    background_opacity = 1.0,
-    border_opacity = 1.0,
-    background_color = {1.0, 1.0, 1.0, 1.0},
-    border_color = {1.0, 1.0, 1.0, 1.0},
-    outline_color = {0.0, 0.0, 0.0, 1.0},
-    colors = T{
-        chat = T{
-            say = {1.0, 1.0, 1.0, 1.0},
-            tell = {0.8, 0.4, 1.0, 1.0},
-            party = {0.4, 1.0, 1.0, 1.0},
-            linkshell = {0.6, 1.0, 0.6, 1.0},
-            linkshell2 = {0.6, 1.0, 0.6, 1.0},
-            unity = {0.5, 0.8, 0.5, 1.0},
-            emotes = {0.6, 0.8, 1.0, 1.0},
-            messages = {1.0, 1.0, 1.0, 1.0},
-            npc = {1.0, 1.0, 1.0, 1.0},
-            shout = {1.0, 1.0, 0.4, 1.0},
-            yell = {1.0, 0.6, 0.2, 1.0},
-        },
-        self = T{
-            hpmp_recovered = {0.6, 1.0, 0.6, 1.0},
-            hpmp_lost = {1.0, 0.2, 0.2, 1.0},
-            beneficial_effects = {0.4, 0.6, 1.0, 1.0},
-            detrimental_effects = {0.8, 0.4, 1.0, 1.0},
-            resisted_effects = {1.0, 0.7, 0.4, 1.0},
-            evaded_actions = {1.0, 0.7, 0.8, 1.0},
-        },
-        others = T{
-            hpmp_recovered = {0.6, 1.0, 0.6, 1.0},
-            hpmp_lost = {1.0, 0.2, 0.2, 1.0},
-            beneficial_effects = {0.4, 0.6, 1.0, 1.0},
-            detrimental_effects = {0.8, 0.4, 1.0, 1.0},
-            resisted_effects = {1.0, 0.7, 0.4, 1.0},
-            evaded_actions = {1.0, 0.7, 0.8, 1.0},
-        },
-        system = T{
-            standard_battle = {0.6, 0.8, 1.0, 1.0},
-            calls_for_help = {1.0, 0.6, 0.2, 1.0},
-            basic_system = {0.95, 0.85, 0.6, 1.0},
-        },
-    },
-})
+config = settings.load(defaults.chatter_settings)
 
-if config.background_asset == nil or config.background_asset == '' then
-    config.background_asset = 'Progressive-Blue'
+local function apply_default_value(value, default)
+    if value == nil then
+        return default
+    end
+    if type(value) == 'string' and value == '' then
+        return default
+    end
+    return value
 end
-if config.border_asset == nil or config.border_asset == '' then
-    config.border_asset = 'Whispered-Veil'
+
+local default_chat_colors = defaults.chat_colors
+local default_self_colors = defaults.self_colors
+local default_system_colors = defaults.system_colors
+
+config.background_asset = apply_default_value(config.background_asset, defaults.chatter_settings.background_asset)
+config.border_asset = apply_default_value(config.border_asset, defaults.chatter_settings.border_asset)
+config.context_menu_theme = apply_default_value(config.context_menu_theme, config.background_asset)
+config.background_scale = apply_default_value(config.background_scale, defaults.chatter_settings.background_scale)
+config.border_scale = apply_default_value(config.border_scale, defaults.chatter_settings.border_scale)
+config.background_opacity = apply_default_value(config.background_opacity, defaults.chatter_settings.background_opacity)
+config.border_opacity = apply_default_value(config.border_opacity, defaults.chatter_settings.border_opacity)
+config.padding_x = apply_default_value(config.padding_x, defaults.chatter_settings.padding_x)
+config.padding_y = apply_default_value(config.padding_y, defaults.chatter_settings.padding_y)
+config.background_color = apply_default_value(config.background_color, defaults.chatter_settings.background_color)
+config.border_color = apply_default_value(config.border_color, defaults.chatter_settings.border_color)
+config.font_family = apply_default_value(config.font_family, defaults.chatter_settings.font_family)
+config.font_size = apply_default_value(config.font_size, defaults.chatter_settings.font_size)
+config.font_bold = apply_default_value(config.font_bold, defaults.chatter_settings.font_bold)
+config.font_italic = apply_default_value(config.font_italic, defaults.chatter_settings.font_italic)
+config.outline_enabled = apply_default_value(config.outline_enabled, defaults.chatter_settings.outline_enabled)
+config.colors = apply_default_value(config.colors, T{})
+config.colors.chat = apply_default_value(config.colors.chat, T{})
+config.colors.self = apply_default_value(config.colors.self, T{})
+config.colors.others = apply_default_value(config.colors.others, T{})
+config.colors.system = apply_default_value(config.colors.system, T{})
+
+for k, v in pairs(default_chat_colors) do
+    if config.colors.chat[k] == nil then
+        config.colors.chat[k] = {v[1], v[2], v[3], v[4]}
+    end
 end
-if config.context_menu_theme == nil or config.context_menu_theme == '' then
-    config.context_menu_theme = config.background_asset
+for k, v in pairs(default_self_colors) do
+    if config.colors.self[k] == nil then
+        config.colors.self[k] = {v[1], v[2], v[3], v[4]}
+    end
+    if config.colors.others[k] == nil then
+        config.colors.others[k] = {v[1], v[2], v[3], v[4]}
+    end
+end
+for k, v in pairs(default_system_colors) do
+    if config.colors.system[k] == nil then
+        config.colors.system[k] = {v[1], v[2], v[3], v[4]}
+    end
 end
 
 if config.outline_color == nil then
-    config.outline_color = {0.0, 0.0, 0.0, 1.0}
+    config.outline_color = defaults.chatter_settings.outline_color
 end
 if config.font_style == nil or config.font_style == '' then
     if config.font_bold and config.font_italic then
         config.font_style = 'Bold Italic'
     elseif config.font_italic then
         config.font_style = 'Italic'
-    else
+    elseif config.font_bold then
         config.font_style = 'Bold'
-        config.font_bold = true
+    else
+        config.font_style = 'Normal'
+        config.font_bold = false
         config.font_italic = false
     end
 end
@@ -192,23 +180,28 @@ elseif config.font_style == 'Italic' then
 elseif config.font_style == 'Bold' then
     config.font_bold = true
     config.font_italic = false
+elseif config.font_style == 'Normal' then
+    config.font_bold = false
+    config.font_italic = false
 else
-    config.font_style = 'Bold'
-    config.font_bold = true
+    config.font_style = 'Normal'
+    config.font_bold = false
     config.font_italic = false
 end
 
-if config.colors and config.colors.self and config.colors.others and config.colors.self == config.colors.others then
-    local copy = T{}
-    for k, v in pairs(config.colors.self) do
-        if type(v) == 'table' then
-            copy[k] = {v[1], v[2], v[3], v[4]}
-        else
-            copy[k] = v
+if config.colors and config.colors.self then
+    if not config.colors.others or config.colors.others == config.colors.self then
+        local copy = T{}
+        for k, v in pairs(config.colors.self) do
+            if type(v) == 'table' then
+                copy[k] = {v[1], v[2], v[3], v[4]}
+            else
+                copy[k] = v
+            end
         end
+        config.colors.others = copy
+        request_save()
     end
-    config.colors.others = copy
-    request_save()
 end
 
 local CHAT_MODES = {
@@ -354,6 +347,7 @@ ashita.events.register('load', 'chatter_load', function()
     renderer.set_border_scale(config.border_scale or 1.0)
     renderer.set_background_opacity(config.background_opacity or 1.0)
     renderer.set_border_opacity(config.border_opacity or 1.0)
+    renderer.set_context_menu_opacity(1.0)
     renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
 
     resize_icon_path = addon.path .. 'assets\\backgrounds\\resize.png'
@@ -927,6 +921,8 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                     request_save()
                 end
 
+                renderer.set_context_menu_opacity(1.0)
+
                 local pad_x_buf = { config.padding_x or 5 }
                 if imgui.SliderInt("Window Padding X", pad_x_buf, 0, 30) then
                     config.padding_x = pad_x_buf[1]
@@ -939,26 +935,6 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                     config.padding_y = pad_y_buf[1]
                     renderer.set_chat_padding(get_effective_padding(config.padding_x), get_effective_padding(config.padding_y))
                     request_save()
-                end
-
-                imgui.Spacing()
-                imgui.Text("Context Menu")
-
-                local current_menu_theme = config.context_menu_theme or 'Plain'
-                if imgui.BeginCombo("Context Menu Background", display_for(bg_items, current_menu_theme)) then
-                    for _, it in ipairs(bg_items) do
-                        local name = it.base
-                        local selected = (current_menu_theme == name)
-                        if imgui.Selectable(it.display_num or it.display, selected) then
-                            config.context_menu_theme = name
-                            renderer.set_context_menu_background_asset(name)
-                            request_save()
-                        end
-                        if selected then
-                            imgui.SetItemDefaultFocus()
-                        end
-                    end
-                    imgui.EndCombo()
                 end
 
                 local lock_val = { config.lock_window }
@@ -1059,9 +1035,9 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                     request_save()
                 end
                 
-                local style_options = { 'Bold', 'Italic', 'Bold Italic' }
+                local style_options = { 'Normal', 'Bold', 'Italic', 'Bold Italic' }
                 local current_style = config.font_style or 'Bold'
-                if current_style ~= 'Bold' and current_style ~= 'Italic' and current_style ~= 'Bold Italic' then
+                if current_style ~= 'Normal' and current_style ~= 'Bold' and current_style ~= 'Italic' and current_style ~= 'Bold Italic' then
                     if config.font_bold and config.font_italic then
                         current_style = 'Bold Italic'
                     elseif config.font_italic then
@@ -1083,8 +1059,8 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                                 config.font_size,
                                 config.font_bold,
                                 config.font_italic,
-                                config.outline_enabled,
-                                color_to_argb(config.outline_color or {0.0, 0.0, 0.0, 1.0})
+                                false,
+                                nil
                             )
                             request_save()
                         end
@@ -1103,56 +1079,47 @@ ashita.events.register('d3d_present', 'chatter_config_ui', function()
                 local colors = config.colors
                 if colors then
                     if imgui.CollapsingHeader("Chat") then
-                        edit_color("Say (White)", colors.chat, 'say')
-                        edit_color("Tell (Purple)", colors.chat, 'tell')
-                        edit_color("Party (Cyan)", colors.chat, 'party')
-                        edit_color("Linkshell (Light Green)", colors.chat, 'linkshell')
-                        edit_color("Linkshell 2 (Light Green)", colors.chat, 'linkshell2')
-                        edit_color("Unity (Faded Green)", colors.chat, 'unity')
-                        edit_color("Emotes (Light Blue)", colors.chat, 'emotes')
-                        edit_color("Messages (White)", colors.chat, 'messages')
-                        edit_color("NPC (White)", colors.chat, 'npc')
-                        edit_color("Shout (Yellow)", colors.chat, 'shout')
-                        edit_color("Yell (Orange)", colors.chat, 'yell')
-
-                        local outline_col = config.outline_color or {0.0, 0.0, 0.0, 1.0}
-                        local outline_val = {outline_col[1], outline_col[2], outline_col[3], outline_col[4]}
-                        if imgui.ColorEdit4("Outline Color", outline_val, color_flags) then
-                            config.outline_color = outline_val
-                            renderer.update_style(
-                                config.font_family,
-                                config.font_size,
-                                config.font_bold,
-                                config.font_italic,
-                                config.outline_enabled,
-                                color_to_argb(outline_val)
-                            )
-                            request_save()
-                        end
+                        edit_color("Say", colors.chat, 'say')
+                        edit_color("Tell", colors.chat, 'tell')
+                        edit_color("Party", colors.chat, 'party')
+                        edit_color("Linkshell", colors.chat, 'linkshell')
+                        edit_color("Linkshell 2", colors.chat, 'linkshell2')
+                        edit_color("Assist JP", colors.chat, 'assist_jp')
+                        edit_color("Assist EN", colors.chat, 'assist_en')
+                        edit_color("Unity", colors.chat, 'unity')
+                        edit_color("Emotes", colors.chat, 'emotes')
+                        edit_color("Messages", colors.chat, 'messages')
+                        edit_color("NPC", colors.chat, 'npc')
+                        edit_color("Shout", colors.chat, 'shout')
+                        edit_color("Yell", colors.chat, 'yell')
                     end
 
                     if imgui.CollapsingHeader("For Self") then
-                        edit_color("HP/MP Recovered (Light Green)", colors.self, 'hpmp_recovered')
-                        edit_color("HP/MP Lost (Red)", colors.self, 'hpmp_lost')
-                        edit_color("Beneficial Effects (Blue)", colors.self, 'beneficial_effects')
-                        edit_color("Detrimental Effects (Purple)", colors.self, 'detrimental_effects')
-                        edit_color("Resisted Effects (Light Orange)", colors.self, 'resisted_effects')
-                        edit_color("Evaded Actions (Light Pink)", colors.self, 'evaded_actions')
+                        imgui.PushID("self_colors")
+                        edit_color("HP/MP Recovered", colors.self, 'hpmp_recovered')
+                        edit_color("HP/MP Lost", colors.self, 'hpmp_lost')
+                        edit_color("Beneficial Effects", colors.self, 'beneficial_effects')
+                        edit_color("Detrimental Effects", colors.self, 'detrimental_effects')
+                        edit_color("Resisted Effects", colors.self, 'resisted_effects')
+                        edit_color("Evaded Actions", colors.self, 'evaded_actions')
+                        imgui.PopID()
                     end
 
                     if imgui.CollapsingHeader("For Others") then
-                        edit_color("HP/MP Recovered (Light Green)", colors.others, 'hpmp_recovered')
-                        edit_color("HP/MP Lost (Red)", colors.others, 'hpmp_lost')
-                        edit_color("Beneficial Effects (Blue)", colors.others, 'beneficial_effects')
-                        edit_color("Detrimental Effects (Purple)", colors.others, 'detrimental_effects')
-                        edit_color("Resisted Effects (Light Orange)", colors.others, 'resisted_effects')
-                        edit_color("Evaded Actions (Light Pink)", colors.others, 'evaded_actions')
+                        imgui.PushID("others_colors")
+                        edit_color("HP/MP Recovered", colors.others, 'hpmp_recovered')
+                        edit_color("HP/MP Lost", colors.others, 'hpmp_lost')
+                        edit_color("Beneficial Effects", colors.others, 'beneficial_effects')
+                        edit_color("Detrimental Effects", colors.others, 'detrimental_effects')
+                        edit_color("Resisted Effects", colors.others, 'resisted_effects')
+                        edit_color("Evaded Actions", colors.others, 'evaded_actions')
+                        imgui.PopID()
                     end
 
                     if imgui.CollapsingHeader("System") then
-                        edit_color("Standard Battle Messages (Light Blue)", colors.system, 'standard_battle')
-                        edit_color("Calls For Help (Orange)", colors.system, 'calls_for_help')
-                        edit_color("Basic System Messages (Light Yellow Brown)", colors.system, 'basic_system')
+                        edit_color("Standard Battle Messages", colors.system, 'standard_battle')
+                        edit_color("Calls For Help", colors.system, 'calls_for_help')
+                        edit_color("Basic System Messages", colors.system, 'basic_system')
                     end
                 end
 
