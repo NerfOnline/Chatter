@@ -7,6 +7,23 @@ local gdi = require('submodules.gdifonts.include')
 local spritebackground = require('core.spritebackground')
 local bit = require('bit')
 
+local function clamp(value, lo, hi)
+    if value == nil then return lo end
+    if value < lo then return lo end
+    if value > hi then return hi end
+    return value
+end
+
+function renderer.begin_background_load()
+    if bg_loader_active then return end
+    bg_loader_active = true
+    bg_loader_stage = 1
+    bg_loader_index = 1
+    print('[Chatter] Beginning background load (incremental).')
+end
+
+renderer.clamp = clamp
+
 -- Localize global functions for performance
 local math_floor = math.floor
 local math_ceil = math.ceil
@@ -139,10 +156,6 @@ local font_pool = {}
 local font_cache = {}
 local pool_size = 200
 local font_height = 14
-local current_font_family = 'Arial'
-local current_font_flags = gdi.FontFlags.Bold
-local current_outline_color = 0xFF000000
-local current_outline_width = 1
 
 -- Layout Store (SoA)
 local layout_store = {
@@ -176,6 +189,7 @@ local free_list = {}
 local last_visible_count = 0
 local background_dirty = true
 local assets_loaded = false
+local assets_minimal = false
 local layout_task = nil
 local layout_rebuild_mode = 'immediate'
 local layout_lines_per_frame = 8
@@ -209,6 +223,19 @@ local addon_path_cache = ''
 local render_ready_once = false
 local preload_resize_done = false
 
+-- Background loader state (incremental creation to avoid a long single-frame stall)
+local bg_loader_active = false
+local bg_loader_stage = 0
+local bg_loader_index = 1
+local BG_LOADER_PER_FRAME = 8
+local bg_loader_total_units = 0
+local bg_loader_done_units = 0
+
+-- Loading bar rects (created during minimal init)
+local loading_bar_bg = nil
+local loading_bar_fill = nil
+
+
 local bg_sprite = nil
 local bg_texture = nil
 local spritebg = nil
@@ -233,7 +260,13 @@ local context_menu_w = 0
 local context_menu_h = 0
 local context_menu_padding = 8
 local context_menu_item_spacing = 4
-local context_menu_items = { 'Copy Text', 'Send Tell', 'Configuration' }
+
+-- Context menu:
+-- The renderer only draws what it's told to draw; the actual ordering/enable logic
+-- lives in config (see `renderer.set_context_menu_items`).
+local context_menu_items = { 'Copy Selected Text', 'Send Tell', 'Customize Context Menu', 'Open Configuration' }
+
+-- Keep the backing font objects; their count should always match #context_menu_items.
 local context_menu_fonts = {}
 local context_menu_bg_rect = nil
 local context_menu_bg_texture = nil
@@ -464,30 +497,6 @@ local function update_context_menu_background_geometry()
     )
 end
 
-local function create_context_menu_font()
-    local font_settings = {
-        box_height = 0,
-        box_width = 0,
-        font_alignment = gdi.Alignment.Left,
-        font_color = 0xFFFFFFFF,
-        font_family = current_font_family,
-        font_flags = current_font_flags,
-        font_height = font_height,
-        gradient_color = 0x00000000,
-        gradient_style = 0,
-        opacity = 1,
-        outline_color = current_outline_color,
-        outline_width = current_outline_width,
-        position_x = 0,
-        position_y = 0,
-        text = '',
-        visible = false,
-        z_order = 6,
-    }
-    local font = gdi:create_object(font_settings, false)
-    return CachedFont.new(font)
-end
-
 local function get_xiui_addon_path()
     local lower = addon_path_cache:lower()
     local idx = lower:find('\\chatter\\', 1, true) or lower:find('/chatter/', 1, true)
@@ -514,7 +523,7 @@ end
 function renderer.initialize(addon_path)
     addon_path_cache = addon_path
     assets_loaded = false
-    
+
     -- Force cleanup of potential stale objects from previous crashes
     local pm = AshitaCore:GetPrimitiveManager()
     if pm then
@@ -527,7 +536,7 @@ function renderer.initialize(addon_path)
             pm:Delete('chatter_sel_bg_' .. i)
         end
     end
-    
+
     local fm = AshitaCore:GetFontManager()
     if fm then
         for i = 1, pool_size do
@@ -540,9 +549,15 @@ function renderer.initialize(addon_path)
     gdi:set_auto_render(false)
 
     spritebg = spritebackground.new(addon_path_cache)
-    main_bg_handle = spritebg:create_handle(current_background_asset, current_border_asset, background_scale, border_scale)
-    context_bg_handle = spritebg:create_handle(context_menu_background_asset, context_menu_border_asset, background_scale, border_scale)
-    
+    main_bg_handle = spritebg:create_handle(current_background_asset, current_border_asset, background_scale,
+        border_scale)
+    context_bg_handle = spritebg:create_handle(context_menu_background_asset, context_menu_border_asset, background_scale,
+        border_scale)
+
+    -- Update background geometry so the renderer can start rendering immediately.
+    update_background_geometry()
+    background_dirty = false
+
     for i = 1, pool_size do
         local sel_settings = {
             width = 0,
@@ -560,7 +575,7 @@ function renderer.initialize(addon_path)
 
     update_background_geometry()
     background_dirty = false
-    
+
     for i = 1, pool_size do
         local font_settings = {
             box_height = 0,
@@ -586,9 +601,29 @@ function renderer.initialize(addon_path)
     end
 
     for i = 1, #context_menu_items do
-        context_menu_fonts[i] = create_context_menu_font()
+        local font_settings = {
+            box_height = 0,
+            box_width = 0,
+            font_alignment = gdi.Alignment.Left,
+            font_color = 0xFFFFFFFF,
+            font_family = 'Arial',
+            font_flags = gdi.FontFlags.Bold,
+            font_height = font_height,
+            gradient_color = 0x00000000,
+            gradient_style = 0,
+            opacity = 1,
+            outline_color = outline_colors.on,
+            outline_width = 1,
+            position_x = 0,
+            position_y = 0,
+            text = '',
+            visible = false,
+            z_order = 6,
+        }
+        local font = gdi:create_object(font_settings, false)
+        context_menu_fonts[i] = CachedFont.new(font)
     end
-    
+
     local measure_settings = {
         box_height = 0,
         box_width = 0,
@@ -630,11 +665,96 @@ function renderer.initialize(addon_path)
         z_order = 3,
     }
     loading_font = CachedFont.new(gdi:create_object(loading_settings, false))
-    
+
     -- 4. Register Render Loop (Only for textured background & logic updates)
     ashita.events.register('d3d_present', 'chatter_renderer_present', renderer.on_present)
-    
+
     print('[Chatter] Renderer initialized with gdifonts.')
+end
+
+
+-- Minimal initialize: only prepare the background/border handles and the loading font.
+-- This allows the addon to display a loading message quickly while the remainder
+-- of the renderer's heavy setup proceeds incrementally via `begin_background_load()`.
+function renderer.initialize_minimal(addon_path)
+    addon_path_cache = addon_path
+    assets_loaded = false
+    assets_minimal = false
+
+    -- Cleanup a minimal set of primitives to be safe.
+    local pm = AshitaCore:GetPrimitiveManager()
+    if pm then
+        pm:Delete('chatter_bg_rect')
+    end
+
+    ensure_bg_sprite()
+
+    spritebg = spritebackground.new(addon_path_cache)
+    main_bg_handle = spritebg:create_handle(current_background_asset, current_border_asset, background_scale,
+        border_scale)
+    context_bg_handle = spritebg:create_handle(context_menu_background_asset, context_menu_border_asset, background_scale,
+        border_scale)
+
+    -- Create a minimal loading font so we can render "Loading..." immediately.
+    local loading_settings = {
+        box_height = 0,
+        box_width = 0,
+        font_alignment = gdi.Alignment.Left,
+        font_color = 0xFFFFFFFF,
+        font_family = 'Arial',
+        font_flags = gdi.FontFlags.Bold,
+        font_height = font_height,
+        gradient_color = 0x00000000,
+        gradient_style = 0,
+        opacity = 1,
+        outline_color = outline_colors.on,
+        outline_width = 1,
+        position_x = 0,
+        position_y = 0,
+        text = '',
+        visible = false,
+        z_order = 3,
+    }
+    loading_font = CachedFont.new(gdi:create_object(loading_settings, false))
+
+    -- Create small progress bar rects for the loading UI (hidden until used).
+    local bar_bg_settings = {
+        width = 200,
+        height = 10,
+        corner_rounding = 3,
+        outline_color = 0xFF000000,
+        outline_width = 0,
+        fill_color = 0xFF2B2B2B,
+        gradient_style = 0,
+        gradient_color = 0x00000000,
+        position_x = 0,
+        position_y = 0,
+        visible = false,
+        z_order = 4,
+    }
+    loading_bar_bg = gdi:create_rect(bar_bg_settings, false)
+    local bar_fill_settings = {
+        width = 0,
+        height = 10,
+        corner_rounding = 3,
+        outline_color = 0x00000000,
+        outline_width = 0,
+        fill_color = 0xFF3FA0FF,
+        gradient_style = 0,
+        gradient_color = 0x00000000,
+        position_x = 0,
+        position_y = 0,
+        visible = false,
+        z_order = 5,
+    }
+    loading_bar_fill = gdi:create_rect(bar_fill_settings, false)
+
+    -- Register present handler so the loading text and background can render.
+    ashita.events.register('d3d_present', 'chatter_renderer_present', renderer.on_present)
+
+    -- Mark minimal assets ready: background/border handles exist; textures may still be loading.
+    assets_minimal = true
+    print('[Chatter] Renderer minimal initialization complete.')
 end
 
 function renderer.set_background_asset(asset_name)
@@ -691,31 +811,6 @@ function renderer.set_context_menu_border_asset(asset_name)
         spritebg:set_border_asset(context_bg_handle, context_menu_border_asset)
     end
     update_context_menu_layout()
-end
-
-function renderer.set_context_menu_items(items)
-    if items == nil then
-        items = {}
-    end
-    context_menu_items = items
-    local needed = #context_menu_items
-    local current = #context_menu_fonts
-    if needed > current then
-        for i = current + 1, needed do
-            context_menu_fonts[i] = create_context_menu_font()
-        end
-    elseif needed < current then
-        for i = current, needed + 1, -1 do
-            local font = context_menu_fonts[i]
-            if font and font.font then
-                gdi:destroy_object(font.font)
-            end
-            context_menu_fonts[i] = nil
-        end
-    end
-    if context_menu_visible then
-        update_context_menu_layout()
-    end
 end
 
 function renderer.update_geometry(x, y, w, h)
@@ -907,7 +1002,14 @@ end
 
 function renderer.is_assets_loaded()
     if not assets_loaded then
-        assets_loaded = assets_ready()
+        -- If we performed only minimal init, allow rendering to proceed while
+        -- fonts and other heavy assets are still being created. This enables
+        -- the loading text and background to appear immediately.
+        if assets_minimal then
+            assets_loaded = assets_ready()
+        else
+            assets_loaded = assets_ready()
+        end
     end
     return assets_loaded
 end
@@ -936,21 +1038,100 @@ function renderer.show_context_menu(x, y)
             font:set_z_order(10 + i)
         end
     end
+
+    -- Context menu placement:
+    -- We avoid clamping to screen edges; instead we "flip" growth direction per-axis so the
+    -- menu populates away from any edge it would otherwise cross.
+    --
+    -- IMPORTANT DETAILS:
+    -- - Use the D3D viewport RECT (X/Y/Width/Height), not just Width/Height.
+    --   Some setups (multi-monitor / viewport offsets) have a non-zero origin.
+    -- - Always include a small padding margin when deciding if we'd cross an edge.
+    --
+    -- Rules (evaluated per-axis):
+    -- - If (cursor -> down-right) would cross the right edge, flip left.
+    -- - If (cursor -> down-right) would cross the bottom edge, flip up.
+    -- - After flipping, if we'd cross the left/top edge, flip back to the opposite side.
+    --
+    -- If we can't query bounds, we just lay out at the requested position.
+    local screen_x = 0
+    local screen_y = 0
+    local screen_w = 0
+    local screen_h = 0
+
+    -- Query the D3D viewport rect (screen bounds + origin).
+    local device = d3d.get_device()
+    if device then
+        -- Ensure the viewport struct is defined; some environments may not have it declared elsewhere.
+        pcall(function()
+            ffi.cdef[[
+                typedef struct _D3DVIEWPORT8 {
+                    uint32_t X;
+                    uint32_t Y;
+                    uint32_t Width;
+                    uint32_t Height;
+                    float MinZ;
+                    float MaxZ;
+                } D3DVIEWPORT8;
+            ]]
+        end)
+
+        local vp = ffi.new('D3DVIEWPORT8[1]')
+        local ok = pcall(function()
+            return device:GetViewport(vp)
+        end)
+        if ok and vp[0] and (vp[0].Width or 0) > 0 and (vp[0].Height or 0) > 0 then
+            screen_x = vp[0].X or 0
+            screen_y = vp[0].Y or 0
+            screen_w = vp[0].Width
+            screen_h = vp[0].Height
+        end
+    end
+
+    if screen_w <= 0 or screen_h <= 0 then
+        update_context_menu_layout()
+        return
+    end
+
+    -- Layout once to compute correct width/height for flip logic.
     update_context_menu_layout()
-    local max_x = window_rect.x + window_rect.w - context_menu_w
-    local max_y = window_rect.y + window_rect.h - context_menu_h
-    if context_menu_x > max_x then
-        context_menu_x = max_x
+
+    local pad = 6
+    local menu_w = context_menu_w or 0
+    local menu_h = context_menu_h or 0
+
+    -- Viewport edges (account for origin offsets).
+    local left_edge = screen_x + pad
+    local top_edge = screen_y + pad
+    local right_edge = screen_x + screen_w - pad
+    local bottom_edge = screen_y + screen_h - pad
+
+    -- Compute placement by flipping direction on each axis if we'd cross that edge.
+    -- Start with the "down-right" default (cursor is top-left of the menu).
+    local desired_x = context_menu_x
+    local desired_y = context_menu_y
+
+    -- Horizontal flip: if we'd cross right edge, move left of cursor.
+    if (desired_x + menu_w) > right_edge then
+        desired_x = context_menu_x - menu_w
     end
-    if context_menu_y > max_y then
-        context_menu_y = max_y
+    -- If that now crosses left edge, flip back to the right of cursor.
+    if desired_x < left_edge then
+        desired_x = context_menu_x
     end
-    if context_menu_x < window_rect.x then
-        context_menu_x = window_rect.x
+
+    -- Vertical flip: if we'd cross bottom edge, move above cursor.
+    if (desired_y + menu_h) > bottom_edge then
+        desired_y = context_menu_y - menu_h
     end
-    if context_menu_y < window_rect.y then
-        context_menu_y = window_rect.y
+    -- If that now crosses top edge, flip back below cursor.
+    if desired_y < top_edge then
+        desired_y = context_menu_y
     end
+
+    -- Apply final placement and lay out at that position.
+    context_menu_x = desired_x
+    context_menu_y = desired_y
     update_context_menu_layout()
 end
 
@@ -969,6 +1150,83 @@ end
 
 function renderer.is_context_menu_visible()
     return context_menu_visible
+end
+
+-- Sets the visible context menu items (already filtered + ordered by the caller).
+-- This is intentionally simple: labels are the identifiers, and the renderer just
+-- sizes and draws them.
+function renderer.set_context_menu_items(items)
+    if type(items) ~= 'table' then
+        return
+    end
+
+    -- Update labels.
+    context_menu_items = items
+
+    -- Ensure we have exactly one font per item.
+    -- If renderer isn't initialized yet, `gdi` will be nil and fonts will be created later.
+    if gdi then
+        -- Destroy extra fonts.
+        for i = (#items + 1), #context_menu_fonts do
+            local f = context_menu_fonts[i]
+            if f and f.font then
+                gdi:destroy_object(f.font)
+            end
+            context_menu_fonts[i] = nil
+        end
+
+        -- Create missing fonts.
+        for i = 1, #items do
+            if not context_menu_fonts[i] then
+                local font_settings = {
+                    box_height = 0,
+                    box_width = 0,
+                    font_alignment = gdi.Alignment.Left,
+                    font_color = 0xFFFFFFFF,
+                    font_family = 'Arial',
+                    font_flags = gdi.FontFlags.Bold,
+                    font_height = font_height,
+                    gradient_color = 0x00000000,
+                    gradient_style = 0,
+                    opacity = 1,
+                    outline_color = outline_colors.on,
+                    outline_width = 1,
+                    position_x = 0,
+                    position_y = 0,
+                    text = '',
+                    visible = false,
+                    z_order = 6,
+                }
+                local font = gdi:create_object(font_settings, false)
+                context_menu_fonts[i] = CachedFont.new(font)
+            end
+        end
+
+        -- Apply the current pending style to any newly-created font objects.
+        -- (If style isn't pending yet, this is a no-op.)
+        for i = 1, #context_menu_fonts do
+            local f = context_menu_fonts[i]
+            if f then
+                if pending_style.family then f:set_font_family(pending_style.family) end
+                if pending_style.size then f:set_font_height(pending_style.size) end
+                if pending_style.flags then f:set_font_flags(pending_style.flags) end
+                if pending_style.outline_color then f:set_outline_color(pending_style.outline_color) end
+            end
+        end
+    end
+
+    -- Re-layout if it is currently visible.
+    if context_menu_visible then
+        update_context_menu_layout()
+    end
+end
+
+-- Returns the label for a hovered item index.
+function renderer.get_context_menu_item_label(index)
+    if type(index) ~= 'number' then
+        return nil
+    end
+    return context_menu_items[index]
 end
 
 function renderer.get_context_menu_item_index(mouse_x, mouse_y)
@@ -1025,15 +1283,74 @@ function renderer.set_selection(start_abs, end_abs)
     is_render_dirty = true
 end
 
+-- Returns the currently selected text across one or more logical chat lines.
+-- This is used by the context menu ("Copy Selected Text") and any other UX that
+-- needs to access the user's selection.
+--
+-- Notes:
+-- - Selection positions are absolute: { line = <chat line index>, char = <1-based char index> }.
+-- - If the selection is empty or invalid, returns an empty string.
+function renderer.get_selected_text()
+    if not selection_start_abs or not selection_end_abs then
+        return ''
+    end
+
+    -- Normalize selection order so (start <= end).
+    local s = selection_start_abs
+    local e = selection_end_abs
+
+    local start_line, start_char, end_line, end_char
+    if s.line > e.line or (s.line == e.line and s.char > e.char) then
+        start_line, start_char = e.line, e.char
+        end_line, end_char = s.line, s.char
+    else
+        start_line, start_char = s.line, s.char
+        end_line, end_char = e.line, e.char
+    end
+
+    if not start_line or not end_line or start_line < 1 or end_line < 1 then
+        return ''
+    end
+    if start_line > end_line then
+        return ''
+    end
+
+    local parts = {}
+
+    for line_idx = start_line, end_line do
+        local text = chatmanager.get_line_text(line_idx) or ''
+        if text ~= '' then
+            local a = 1
+            local b = #text
+
+            if line_idx == start_line then
+                a = start_char or 1
+            end
+            if line_idx == end_line then
+                b = end_char or b
+            end
+
+            if a < 1 then a = 1 end
+            if b > #text then b = #text end
+
+            if b >= a then
+                parts[#parts + 1] = string.sub(text, a, b)
+            end
+        end
+    end
+
+    return table.concat(parts, '\n')
+end
+
 function renderer.update_scroll(delta)
     scroll_offset = scroll_offset + delta
     if scroll_offset < 0 then scroll_offset = 0 end
-    
+
     local max_scroll = chatmanager.count
     if max_scroll < 0 then max_scroll = 0 end
-    
+
     if scroll_offset > max_scroll then scroll_offset = max_scroll end
-    
+
     is_layout_dirty = true
     is_render_dirty = true
 end
@@ -1145,7 +1462,8 @@ update_context_menu_layout = function()
         end
     end
     context_menu_w = max_width + (context_menu_padding * 2)
-    context_menu_h = (#context_menu_items * (font_height + context_menu_item_spacing)) + (context_menu_padding * 2) - context_menu_item_spacing
+    context_menu_h = (#context_menu_items * (font_height + context_menu_item_spacing)) + (context_menu_padding * 2) -
+        context_menu_item_spacing
     update_context_menu_background_geometry()
     local start_x = context_menu_x + context_menu_padding
     local start_y = context_menu_y + context_menu_padding
@@ -1164,12 +1482,12 @@ compute_wrap_length = function(text, start_pos, max_width)
     if not text or text == "" then
         return 0
     end
-    
+
     local len = #text
     if start_pos > len then
         return 0
     end
-    
+
     local available = len - start_pos + 1
     if max_width <= 0 then
         return available
@@ -1178,16 +1496,16 @@ compute_wrap_length = function(text, start_pos, max_width)
     -- This avoids binary search for short lines (common case) and massive allocs for huge lines.
     local limit = 1000
     local check_len = math_min(available, limit)
-    
+
     -- We must measure the chunk to know if it fits.
     local check_w = measure_substring(text, start_pos, start_pos + check_len - 1)
-    
+
     if check_w <= max_width then
         -- If the checked chunk fits, and it was the whole available text, return it.
         if available <= limit then
             return available
         end
-        -- If we have more text than the limit, but the limit chunk fits, 
+        -- If we have more text than the limit, but the limit chunk fits,
         -- we can safely return 'limit'. The next iteration will handle the rest.
         return limit
     end
@@ -1223,7 +1541,7 @@ compute_wrap_length = function(text, start_pos, max_width)
             end
         end
     end
-    
+
     -- Word wrap logic: Backtrack to last space if we are splitting the line
     if best < available then
         for i = best, 1, -1 do
@@ -1233,7 +1551,7 @@ compute_wrap_length = function(text, start_pos, max_width)
             end
         end
     end
-    
+
     return best
 end
 
@@ -1311,20 +1629,20 @@ end
 
 local function update_visible_layout()
     local lb_idx = 0
-    
+
     local max_text_width = window_rect.w - (PADDING_X * 2)
     if max_text_width <= 0 then max_text_width = 1 end
-    
+
     local page_size = renderer.get_page_size()
     local visible_count = math.min(pool_size, page_size)
     local layout_limit = math.max(100, page_size * 2)
     if is_resizing then
         layout_limit = math_max(visible_count, page_size)
     end
-    
+
     local anchor_idx = chatmanager.count - math.floor(scroll_offset)
     if anchor_idx > chatmanager.count then anchor_idx = chatmanager.count end
-    if anchor_idx < 1 then 
+    if anchor_idx < 1 then
         total_visual_lines = 0
         render_start_index = 1
         for i = 1, #layout_store.line_index do
@@ -1334,27 +1652,27 @@ local function update_visible_layout()
             layout_store.key[i] = nil
             layout_store.segment_text[i] = nil
         end
-        return 
+        return
     end
-    
+
     local visual_lines_generated = 0
     local current_idx = anchor_idx
-    
+
     -- Safety limit
-    local loop_limit = 200 
+    local loop_limit = 200
     if is_resizing then
         loop_limit = math_max(visible_count, page_size)
     end
     local loops = 0
-    
+
     while current_idx >= 1 and visual_lines_generated < layout_limit and loops < loop_limit do
         local text = chatmanager.get_line_text(current_idx) or ""
         local len = #text
         local line_id = chatmanager.get_line_id(current_idx)
-        
+
         local entry = get_wrap_entry(line_id, current_idx, text, max_text_width)
         local seg_count = entry.count
-        
+
         for i = seg_count, 1, -1 do
             lb_idx = lb_idx + 1
             layout_buffer.line_index[lb_idx] = current_idx
@@ -1375,11 +1693,11 @@ local function update_visible_layout()
             end
             visual_lines_generated = visual_lines_generated + 1
         end
-        
+
         current_idx = current_idx - 1
         loops = loops + 1
     end
-    
+
     local store_idx = 0
     for i = lb_idx, 1, -1 do
         store_idx = store_idx + 1
@@ -1389,7 +1707,7 @@ local function update_visible_layout()
         layout_store.key[store_idx] = layout_buffer.key[i]
         layout_store.segment_text[store_idx] = layout_buffer.segment_text[i]
     end
-    
+
     for i = store_idx + 1, #layout_store.line_index do
         layout_store.line_index[i] = nil
         layout_store.start_char[i] = nil
@@ -1397,9 +1715,9 @@ local function update_visible_layout()
         layout_store.key[i] = nil
         layout_store.segment_text[i] = nil
     end
-    
+
     total_visual_lines = store_idx
-    
+
     local visible_count = math.min(pool_size, page_size)
     if total_visual_lines > visible_count then
         render_start_index = total_visual_lines - visible_count + 1
@@ -1548,9 +1866,6 @@ function renderer.update_style(family, size, bold, italic, outline_enabled, outl
     if italic then
         flags = bit.bor(flags, gdi.FontFlags.Italic)
     end
-    current_font_family = family
-    current_font_flags = flags
-    current_outline_color = outline_color
     pending_style.family = family
     pending_style.size = size
     pending_style.flags = flags
@@ -1612,7 +1927,7 @@ function renderer.update_fonts()
         update_visible_layout()
         is_layout_dirty = false
     end
-    
+
     if total_visual_lines == 0 then
         for i = 1, pool_size do
             local font = font_pool[i]
@@ -1627,11 +1942,11 @@ function renderer.update_fonts()
 
     -- With virtual layout, we just render everything in layout_store from start
     -- because layout_store ONLY contains what fits on screen (or slightly more)
-    
+
     local start_index = math_max(1, total_visual_lines - visible_count + 1)
     -- local end_index = math.min(total_visual_lines, visible_count) -- Unused
-    
-    -- If we have fewer lines than page_size, we might need to adjust start_y 
+
+    -- If we have fewer lines than page_size, we might need to adjust start_y
     -- to stick to bottom?
     -- Standard terminal behavior: if few lines, start from top.
     -- If we want to stick to bottom when < page_size, we add padding.
@@ -1643,7 +1958,7 @@ function renderer.update_fonts()
     -- Let's stick to top for now as it's standard for scrolling up.
     -- Actually, if we are at bottom of history, we usually want them at bottom of screen?
     -- Let's stick to top-down rendering of the buffer.
-    
+
     local start_x = window_rect.x + PADDING_X
     local max_text_width = window_rect.w - (PADDING_X * 2)
     local line_height = font_height + LINE_SPACING
@@ -1676,7 +1991,7 @@ function renderer.update_fonts()
             end
         end
     end
-    
+
     for k in pairs(available_fonts) do
         available_fonts[k] = nil
     end
@@ -1695,24 +2010,24 @@ function renderer.update_fonts()
         visible_slot_key[i] = nil
     end
     last_visible_count = visible_count
-    
+
     for i = 1, #font_pool do
         available_fonts[font_pool[i]] = true
     end
-    
+
     -- Pass 1: Identify visible slots and try to match with cache
     -- Note: chatmanager data is a ring buffer, so we must use accessor functions
     -- instead of direct array access.
-    
+
     for i = 1, visible_count do
         local visual_index = start_index + i - 1
-        
+
         -- Bounds check
         if visual_index <= #layout_store.line_index then
             local line_idx = layout_store.line_index[visual_index]
             local start_c = layout_store.start_char[visual_index]
             local end_c = layout_store.end_char[visual_index]
-            
+
             if line_idx then
                 local key = layout_store.key[visual_index]
                 if not key then
@@ -1725,7 +2040,7 @@ function renderer.update_fonts()
                 visible_slot_start[i] = start_c
                 visible_slot_end[i] = end_c
                 visible_slot_key[i] = key
-                
+
                 if key then
                     local cached = font_cache[key]
                     if cached and available_fonts[cached] then
@@ -1736,7 +2051,7 @@ function renderer.update_fonts()
             end
         end
     end
-    
+
     -- Pass 2: Assign remaining slots from free pool
     local free_count = 0
     for f, _ in pairs(available_fonts) do
@@ -1747,14 +2062,14 @@ function renderer.update_fonts()
         free_list[i] = nil
     end
     local free_idx = 1
-    
+
     for i = 1, visible_count do
         if not assignments[i] and visible_slot_line[i] then
             local font = free_list[free_idx]
             free_idx = free_idx + 1
             if font then
                 assignments[i] = font
-                
+
                 -- Update cache mapping
                 local key = visible_slot_key[i]
                 if font.current_key and font.current_key ~= key then
@@ -1772,7 +2087,7 @@ function renderer.update_fonts()
     for i = 1, pool_size do
         local font = assignments[i]
         local sel_rect = selection_rects[i]
-        
+
         if i <= visible_count and font and visible_slot_line[i] then
             local line_idx = visible_slot_line[i]
             local start_c = visible_slot_start[i]
@@ -1836,7 +2151,7 @@ function renderer.update_fonts()
                 color = 0xFFFFFFFF
                 if sel_rect then
                     sel_rect:set_position_x(start_x + sel_x_start)
-                    sel_rect:set_position_y(start_y + (i-1) * line_height)
+                    sel_rect:set_position_y(start_y + (i - 1) * line_height)
                     sel_rect:set_width(sel_x_width)
                     sel_rect:set_height(line_height)
                     sel_rect:set_visible(true)
@@ -1850,24 +2165,24 @@ function renderer.update_fonts()
             font:set_text(segment_text)
             font:set_font_color(color)
             font:set_position_x(start_x)
-            font:set_position_y(start_y + (i-1) * line_height)
+            font:set_position_y(start_y + (i - 1) * line_height)
             font:set_visible(true)
         else
             if sel_rect then sel_rect:set_visible(false) end
         end
     end
-    
+
     -- Pass 4: Hide unused fonts
     for k = free_idx, free_count do
         free_list[k]:set_visible(false)
     end
-    
+
     -- is_dirty handled by caller
 end
 
 function renderer.get_char_index_from_x(text, rel_x)
     if not text or text == "" then return 1 end
-    
+
     local len = #text
     if rel_x <= 0 then
         return 1
@@ -1898,22 +2213,22 @@ function renderer.get_word_boundaries(text, char_index)
     local len = #text
     if char_index < 1 then char_index = 1 end
     if char_index > len then char_index = len end
-    
+
     -- Check if we are on a separator
     local function is_separator(c)
         return c:match("[%s%p]") -- whitespace or punctuation
     end
-    
+
     local start_idx = char_index
     local end_idx = char_index
-    
+
     -- If we clicked on a separator, just select that separator (or word before/after?)
     -- User wants word highlighting. Usually selecting a space selects just the space or the word before.
     -- Let's try to expand to the word.
-    
+
     local char_at = text:sub(char_index, char_index)
     if is_separator(char_at) then
-        -- If on separator, maybe just select the separator? 
+        -- If on separator, maybe just select the separator?
         -- Or try to find the word if it's close?
         -- Let's stick to: expand until separator.
         -- If we are on a separator, the "word" is that sequence of separators.
@@ -1932,15 +2247,145 @@ function renderer.get_word_boundaries(text, char_index)
             end_idx = end_idx + 1
         end
     end
-    
+
     return start_idx, end_idx
 end
 
 local last_line_count = 0
 
 function renderer.on_present()
-    if not geometry_ready then
+    -- Allow the present handler to run during minimal initialization / background loading
+    -- so the loading text and progress bar can be displayed. If neither geometry is
+    -- ready nor a background load is active, bail out early as before.
+    if not geometry_ready and not bg_loader_active and not assets_minimal then
         return
+    end
+
+    -- Incremental background loader: perform a small amount of heavy setup each frame
+    -- to avoid freezing the game on addon load. Stages:
+    -- 1: load history and welcome messages
+    -- 2: create selection rects and font pool (incremental)
+    -- 3: create context menu fonts
+    -- 4: finalize (measure font, style updates)
+    if bg_loader_active then
+        if bg_loader_stage == 1 then
+            -- Stage 1: load chat history (file IO) and add welcome messages
+            pcall(function()
+                chatmanager.load_history(addon_path_cache .. 'chathistory.lua')
+                chatmanager.add_line('Chatter v2.0 Initialized.', 0xFF00FF00)
+                chatmanager.add_line('Engine: Ashita Fonts + ImGui Window', 0xFFFFFF00)
+            end)
+            bg_loader_stage = 2
+            bg_loader_index = 1
+            -- compute total units for progress reporting
+            bg_loader_done_units = 1
+            bg_loader_total_units = 1 + pool_size + #context_menu_items + 1
+        elseif bg_loader_stage == 2 then
+            -- Stage 2: create selection rects and font pool incrementally
+            local created = 0
+            while created < BG_LOADER_PER_FRAME and bg_loader_index <= pool_size do
+                local sel_settings = {
+                    width = 0,
+                    height = 0,
+                    outline_width = 0,
+                    fill_color = 0xC00078D7,
+                    position_x = 0,
+                    position_y = 0,
+                    visible = false,
+                    z_order = 1,
+                }
+                local rect = gdi:create_rect(sel_settings, false)
+                table.insert(selection_rects, rect)
+
+                local font_settings = {
+                    box_height = 0,
+                    box_width = 0,
+                    font_alignment = gdi.Alignment.Left,
+                    font_color = 0xFFFFFFFF,
+                    font_family = 'Arial',
+                    font_flags = gdi.FontFlags.Bold,
+                    font_height = font_height,
+                    gradient_color = 0x00000000,
+                    gradient_style = 0,
+                    opacity = 1,
+                    outline_color = outline_colors.on,
+                    outline_width = 1,
+                    position_x = 0,
+                    position_y = 0,
+                    text = '',
+                    visible = false,
+                    z_order = 2,
+                }
+                local font = gdi:create_object(font_settings, false)
+                table.insert(font_pool, CachedFont.new(font))
+
+                bg_loader_index = bg_loader_index + 1
+                created = created + 1
+                bg_loader_done_units = bg_loader_done_units + 1
+            end
+            if bg_loader_index > pool_size then
+                bg_loader_stage = 3
+                bg_loader_index = 1
+            end
+        elseif bg_loader_stage == 3 then
+            -- Stage 3: create context menu fonts
+            for i = 1, #context_menu_items do
+                local font_settings = {
+                    box_height = 0,
+                    box_width = 0,
+                    font_alignment = gdi.Alignment.Left,
+                    font_color = 0xFFFFFFFF,
+                    font_family = 'Arial',
+                    font_flags = gdi.FontFlags.Bold,
+                    font_height = font_height,
+                    gradient_color = 0x00000000,
+                    gradient_style = 0,
+                    opacity = 1,
+                    outline_color = outline_colors.on,
+                    outline_width = 1,
+                    position_x = 0,
+                    position_y = 0,
+                    text = '',
+                    visible = false,
+                    z_order = 6,
+                }
+                local font = gdi:create_object(font_settings, false)
+                context_menu_fonts[i] = CachedFont.new(font)
+                bg_loader_done_units = bg_loader_done_units + 1
+            end
+            bg_loader_stage = 4
+        elseif bg_loader_stage == 4 then
+            -- Stage 4: create measure font and finalize
+            local measure_settings = {
+                box_height = 0,
+                box_width = 0,
+                font_alignment = gdi.Alignment.Left,
+                font_color = 0xFFFFFFFF,
+                font_family = 'Arial',
+                font_flags = gdi.FontFlags.Bold,
+                font_height = font_height,
+                gradient_color = 0x00000000,
+                gradient_style = 0,
+                opacity = 1,
+                outline_color = outline_colors.on,
+                outline_width = 1,
+                position_x = 0,
+                position_y = 0,
+                text = '',
+                visible = false,
+                z_order = 0,
+            }
+            measure_font = CachedFont.new(gdi:create_object(measure_settings, false))
+
+            bg_loader_done_units = bg_loader_done_units + 1
+
+            -- Mark background loading finished; allow full rendering to proceed.
+            bg_loader_active = false
+            assets_loaded = false -- will be recomputed by is_assets_loaded()
+            is_layout_dirty = true
+            is_render_dirty = true
+            print('[Chatter] Background loading complete.')
+        end
     end
     local current_count = chatmanager.get_line_count()
     if current_count ~= last_line_count then
@@ -2032,6 +2477,16 @@ function renderer.on_present()
                 loading_font:set_visible(false)
             end
 
+            -- Destroy loading bar rects
+            if loading_bar_bg then
+                gdi:destroy_object(loading_bar_bg)
+                loading_bar_bg = nil
+            end
+            if loading_bar_fill then
+                gdi:destroy_object(loading_bar_fill)
+                loading_bar_fill = nil
+            end
+
             for i = 1, #selection_rects do
                 local rect = selection_rects[i]
                 if rect then
@@ -2077,6 +2532,49 @@ function renderer.on_present()
                 if loading_font.font then
                     loading_font.font:render(bg_sprite)
                 end
+                    -- Render progress bar and percentage if incremental loader is active
+                    if bg_loader_active and loading_bar_bg and loading_bar_fill then
+                        local percent = 0
+                        if bg_loader_total_units > 0 then
+                            percent = math_min(1.0, bg_loader_done_units / bg_loader_total_units)
+                        end
+                        local bar_w = math.floor(window_rect.w * 0.5)
+                        local bar_h = 12
+                        local bar_x = window_rect.x + ((window_rect.w - bar_w) * 0.5)
+                        local bar_y = y + text_h + 8
+
+                        loading_bar_bg:set_position_x(bar_x)
+                        loading_bar_bg:set_position_y(bar_y)
+                        loading_bar_bg:set_width(bar_w)
+                        loading_bar_bg:set_height(bar_h)
+                        loading_bar_bg:set_fill_color(0xFF222222)
+                        loading_bar_bg:set_corner_rounding(3)
+                        loading_bar_bg:render(bg_sprite)
+
+                        local fill_w = math.max(2, math.floor(bar_w * percent))
+                        loading_bar_fill:set_position_x(bar_x)
+                        loading_bar_fill:set_position_y(bar_y)
+                        loading_bar_fill:set_width(fill_w)
+                        loading_bar_fill:set_height(bar_h)
+                        loading_bar_fill:set_fill_color(0xFF3FA0FF)
+                        loading_bar_fill:set_corner_rounding(3)
+                        loading_bar_fill:render(bg_sprite)
+
+                        -- Percentage text
+                        local pct_text = string_format('%d%%', math.floor(percent * 100))
+                        local pw, ph = loading_font:get_text_size()
+                        loading_font:set_text(pct_text)
+                        local px = window_rect.x + ((window_rect.w - pw) * 0.5)
+                        local py = bar_y + bar_h + 6
+                        loading_font:set_position_x(px)
+                        loading_font:set_position_y(py)
+                        loading_font:set_visible(true)
+                        if loading_font.font then
+                            loading_font.font:render(bg_sprite)
+                        end
+                        -- restore 'Loading...' text for next frame
+                        loading_font:set_text('Loading...')
+                    end
             end
             if spritebg and main_bg_handle then
                 spritebg:draw_borders(main_bg_handle, bg_sprite)

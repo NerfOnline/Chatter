@@ -85,20 +85,44 @@ local global_settings = T{
     },
 }
 
+-- NOTE: Colors are stored as RGBA in the format:
+--   { r, g, b, a }
+-- Where r/g/b are 0-255 and a is 0.0-1.0.
 local chatter_settings = T{
     theme = 'Plain',
     background_asset = 'Progressive-Blue',
     border_asset = 'Whispered-Veil',
     context_menu_theme = 'Progressive-Blue',
+
+    -- Context menu configuration:
+    -- `context_menu_items` is the ordered list of entries you want to appear.
+    -- `context_menu_enabled` allows you to hide entries without losing their position/order.
+    --
+    -- Notes:
+    -- - Labels are the display text shown in the in-game context menu.
+    -- - These defaults match the requested new names and default insertion point.
+    context_menu_items = T{
+        'Copy Selected Text',
+        'Send Tell',
+        'Customize Context Menu',
+        'Open Configuration',
+    },
+    context_menu_enabled = T{
+        ['Copy Selected Text'] = true,
+        ['Send Tell'] = true,
+        ['Customize Context Menu'] = true,
+        ['Open Configuration'] = true,
+    },
+
     font_family = 'Arial',
     font_size = 14,
     font_bold = true,
     font_italic = false,
     outline_enabled = false,
-    window_x = 100,
-    window_y = 100,
-    window_w = 600,
-    window_h = 400,
+    window_x = 20,
+    window_y = 545,
+    window_w = 645,
+    window_h = 220,
     lock_window = false,
     padding_x = 0,
     padding_y = 0,
@@ -106,86 +130,83 @@ local chatter_settings = T{
     border_scale = 1.0,
     background_opacity = 0.7,
     border_opacity = 1.0,
-    background_color = {0.8235, 0.7843, 1.0, 0.7020},
-    border_color = {0.8235, 0.7843, 1.0, 1.0},
-    outline_color = {0.0, 0.0, 0.0, 1.0},
-    context_menu_config = T{
-        items = T{
-            { label = 'Copy Selected Text', enabled = true },
-            { label = 'Send Tell', enabled = true },
-            { label = 'Customize Context Menu', enabled = true },
-            { label = 'Open Configuration', enabled = true },
-        },
-    },
+
+    -- Converted from {0.8235, 0.7843, 1.0, 0.7020}
+    background_color = { 210, 200, 255, 0.7 },
+    -- Converted from {0.8235, 0.7843, 1.0, 1.0}
+    border_color = { 210, 200, 255, 1.0 },
+    -- Converted from {0.0, 0.0, 0.0, 1.0}
+    outline_color = { 0, 0, 0, 1.0 },
+
     colors = T{
         chat = T{
-            say = {1.0, 1.0, 1.0, 1.0},
-            tell = {1.0, 0.0, 1.0, 1.0},
-            party = {0.0, 1.0, 1.0, 1.0},
-            linkshell = {0.0, 1.0, 0.0, 1.0},
-            linkshell2 = {0.0, 1.0, 0.0, 1.0},
-            assist_jp = {0.2510, 0.5020, 1.0, 1.0},
-            assist_en = {0.2510, 0.5020, 1.0, 1.0},
-            unity = {0.5020, 1.0, 0.5020, 1.0},
-            emotes = {0.0, 0.7529, 1.0, 1.0},
-            messages = {1.0, 1.0, 1.0, 1.0},
-            npc = {1.0, 1.0, 1.0, 1.0},
-            shout = {1.0, 1.0, 0.0, 1.0},
-            yell = {1.0, 0.5020, 0.0, 1.0},
+            say = { 255, 255, 255, 1.0 },
+            tell = { 255, 0, 255, 1.0 },
+            party = { 0, 255, 255, 1.0 },
+            linkshell = { 0, 255, 0, 1.0 },
+            linkshell2 = { 0, 255, 0, 1.0 },
+            assist_jp = { 64, 128, 255, 1.0 },
+            assist_en = { 64, 128, 255, 1.0 },
+            unity = { 128, 255, 128, 1.0 },
+            emotes = { 0, 192, 255, 1.0 },
+            messages = { 255, 255, 255, 1.0 },
+            npc = { 255, 255, 255, 1.0 },
+            shout = { 255, 255, 0, 1.0 },
+            yell = { 255, 128, 0, 1.0 },
         },
         self = T{
-            hpmp_recovered = {0.0, 1.0, 0.0, 1.0},
-            hpmp_lost = {1.0, 0.0, 0.0, 1.0},
-            beneficial_effects = {0.0, 0.0, 1.0, 1.0},
-            detrimental_effects = {0.5020, 0.0157, 0.5020, 1.0},
-            resisted_effects = {1.0, 0.7529, 0.0, 1.0},
-            evaded_actions = {1.0, 0.5020, 0.7843, 1.0},
+            hpmp_recovered = { 0, 255, 0, 1.0 },
+            hpmp_lost = { 255, 0, 0, 1.0 },
+            beneficial_effects = { 0, 0, 255, 1.0 },
+            detrimental_effects = { 128, 4, 128, 1.0 },
+            resisted_effects = { 255, 192, 0, 1.0 },
+            evaded_actions = { 255, 128, 200, 1.0 },
         },
         others = T{
-            hpmp_recovered = {0.0, 1.0, 0.0, 1.0},
-            hpmp_lost = {1.0, 0.0, 0.0, 1.0},
-            beneficial_effects = {0.0, 0.0, 1.0, 1.0},
-            detrimental_effects = {0.5020, 0.0157, 0.5020, 1.0},
-            resisted_effects = {1.0, 0.7529, 0.0, 1.0},
-            evaded_actions = {1.0, 0.5020, 0.7843, 1.0},
+            hpmp_recovered = { 0, 255, 0, 1.0 },
+            hpmp_lost = { 255, 0, 0, 1.0 },
+            beneficial_effects = { 0, 0, 255, 1.0 },
+            detrimental_effects = { 128, 4, 128, 1.0 },
+            resisted_effects = { 255, 192, 0, 1.0 },
+            evaded_actions = { 255, 128, 200, 1.0 },
         },
         system = T{
-            standard_battle = {0.2510, 0.5020, 1.0, 1.0},
-            calls_for_help = {1.0, 0.5020, 0.0, 1.0},
-            basic_system = {0.9490, 0.8510, 0.6000, 1.0},
+            standard_battle = { 64, 128, 255, 1.0 },
+            calls_for_help = { 255, 128, 0, 1.0 },
+            basic_system = { 242, 217, 153, 1.0 },
         },
     },
 }
 
 local chat_colors = {
-    say = {1.0, 1.0, 1.0, 1.0},
-    tell = {1.0, 0.0, 1.0, 1.0},
-    party = {0.0, 1.0, 1.0, 1.0},
-    linkshell = {0.0, 1.0, 0.0, 1.0},
-    linkshell2 = {0.0, 1.0, 0.0, 1.0},
-    assist_jp = {0.2510, 0.5020, 1.0, 1.0},
-    assist_en = {0.2510, 0.5020, 1.0, 1.0},
-    unity = {0.5020, 1.0, 0.5020, 1.0},
-    emotes = {0.0, 0.7529, 1.0, 1.0},
-    messages = {1.0, 1.0, 1.0, 1.0},
-    npc = {1.0, 1.0, 1.0, 1.0},
-    shout = {1.0, 1.0, 0.0, 1.0},
-    yell = {1.0, 0.5020, 0.0, 1.0},
+    say = { 255, 255, 255, 1.0 },
+    tell = { 255, 0, 255, 1.0 },
+    party = { 0, 255, 255, 1.0 },
+    linkshell = { 0, 255, 0, 1.0 },
+    linkshell2 = { 0, 255, 0, 1.0 },
+    assist_jp = { 64, 128, 255, 1.0 },
+    assist_en = { 64, 128, 255, 1.0 },
+    unity = { 128, 255, 128, 1.0 },
+    emotes = { 0, 192, 255, 1.0 },
+    messages = { 255, 255, 255, 1.0 },
+    npc = { 255, 255, 255, 1.0 },
+    shout = { 255, 255, 0, 1.0 },
+    yell = { 255, 128, 0, 1.0 },
 }
 
 local self_colors = {
-    hpmp_recovered = {0.0, 1.0, 0.0, 1.0},
-    hpmp_lost = {1.0, 0.0, 0.0, 1.0},
-    beneficial_effects = {0.0, 0.0, 1.0, 1.0},
-    detrimental_effects = {0.5020, 0.0157, 0.5020, 1.0},
-    resisted_effects = {1.0, 0.7529, 0.0, 1.0},
-    evaded_actions = {1.0, 0.5020, 0.7843, 1.0},
+    hpmp_recovered = { 0, 255, 0, 1.0 },
+    hpmp_lost = { 255, 0, 0, 1.0 },
+    beneficial_effects = { 0, 0, 255, 1.0 },
+    detrimental_effects = { 128, 4, 128, 1.0 },
+    resisted_effects = { 255, 192, 0, 1.0 },
+    evaded_actions = { 255, 128, 200, 1.0 },
 }
 
 local system_colors = {
-    standard_battle = {0.2510, 0.5020, 1.0, 1.0},
-    calls_for_help = {1.0, 0.5020, 0.0, 1.0},
-    basic_system = {0.9490, 0.8510, 0.6000, 1.0},
+    standard_battle = { 64, 128, 255, 1.0 },
+    calls_for_help = { 255, 128, 0, 1.0 },
+    basic_system = { 242, 217, 153, 1.0 },
 }
 
 return {

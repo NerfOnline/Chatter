@@ -1,5 +1,9 @@
 local chatmanager = {}
 
+-- Tunables
+local MAX_LOG_LINES = 50000
+local DEFAULT_TEXT_COLOR = 0xFFFFFFFF
+
 -- Structure of Arrays (SoA) for memory efficiency
 chatmanager.data = {
     text = {},
@@ -8,7 +12,7 @@ chatmanager.data = {
     id = {}
 }
 chatmanager.count = 0
-chatmanager.max_lines = 50000
+chatmanager.max_lines = MAX_LOG_LINES
 chatmanager.next_id = 1
 chatmanager.start_index = 1 -- Index of the oldest message in the ring buffer
 
@@ -30,7 +34,7 @@ function chatmanager.add_line(text, color)
     end
     
     chatmanager.data.text[idx] = text
-    chatmanager.data.color[idx] = color or 0xFFFFFFFF
+    chatmanager.data.color[idx] = color or DEFAULT_TEXT_COLOR
     chatmanager.data.timestamp[idx] = os.time()
     chatmanager.data.id[idx] = chatmanager.next_id
     
